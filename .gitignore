@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Backups / editor cruft
+*.bak
+*.swp
+*~
+
+# Claude Code local (machine-specific) settings & runtime locks
+.claude/settings.local.json
+.claude/*.lock

@@ -1,0 +1,7 @@
+# Dev/test dependencies. Install with:
+#   venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+# then run the suite from this folder with:  python -m pytest -q
+-r requirements.txt
+pytest==9.1.1
+pytest-asyncio==1.4.0
+respx==0.23.1

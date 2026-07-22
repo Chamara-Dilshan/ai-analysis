@@ -1,0 +1,4 @@
+# Runtime dependencies — pinned to the versions verified working 2026-07-23.
+# (Bump deliberately, then re-run: pytest -q)
+fastmcp==3.4.4
+httpx==0.28.1
