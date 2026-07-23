@@ -56,10 +56,11 @@ The coach checks your thinking. **You** make every decision.
 ---
 
 ## 💸 ACCOUNT REALITY (read this before every session)
-- Minimum order ≈ 0.001 BTC (~$65 notional at current price).
+- Minimum order = **0.001 BTC _and_ $100 notional** (Binance's `MIN_NOTIONAL` filter) — whichever is larger binds. On a $100 account your smallest real position is ≈$100 of exposure (≈1× your whole capital in notional).
 - Round-trip fees ≈ 0.08–0.10% of notional.
 - Trading several times a day = fees quietly eat most of a $2-risk trade.
 - **Fewer, cleaner trades beat many small ones on a $100 account.**
+- Let the coach's `calculate_position_size` tool check this — if a setup can't be sized within the 2% rule _and_ above the minimum, it tells you to skip.
 
 ---
 *Built as a discipline system — Elliott Wave + ICT + SMC*

@@ -61,7 +61,7 @@ Example: $100 × 1% = $1 risk;  SL = 0.5%  →  $1 / 0.005 = $200 position
 At 3x leverage: margin ≈ $200 / 3 ≈ $67
 ```
 
-**⚠️ Account-size warning:** On $100 this formula often produces positions below Binance's minimum (0.001 BTC) OR forces you to break your risk rule to meet it. If the math doesn't fit cleanly — **skip the trade.** Don't force size.
+**⚠️ Account-size warning:** On $100 this formula often produces positions below Binance's minimum — **0.001 BTC _and_ $100 notional**, whichever is larger — OR forces you to break your risk rule to meet it. If the math doesn't fit cleanly — **skip the trade.** Don't force size. (The `calculate_position_size` tool flags this automatically.)
 
 **Leverage by condition**
 - Strong trend + clean setup → max 5x
