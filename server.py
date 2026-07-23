@@ -79,7 +79,9 @@ mcp = FastMCP(
         "Also a position-size/risk calculator that enforces the $100 plan (2% "
         "risk, 5x leverage, 1:2 R:R, Binance minimums), a UTC session clock "
         "for London/New York kill-zone timing, and a high-impact economic "
-        "calendar for news blackouts (no trading 30 min around FOMC/CPI/NFP etc.). "
+        "calendar for news blackouts (no trading 30 min around FOMC/CPI/NFP etc.), "
+        "and a get_top_down tool that fetches Daily+4H+1H structure in one call "
+        "for the plan's top-down framework. "
         "Use these together for full Elliott Wave / ICT / SMC context, not just "
         "BTC futures in isolation."
     ),
@@ -628,8 +630,11 @@ async def get_market_structure(
     """
     Compute ICT / SMC market structure from candles: swing points, market
     structure (BOS / CHoCH) with current trend, Fair Value Gaps, order blocks,
-    equal-high/low liquidity, and premium/discount of the dealing range. This is
-    the structural read that raw candles alone don't give you.
+    equal-high/low liquidity, premium/discount of the CURRENT dealing range
+    (last swing low to last swing high — zone can be "above_range" or
+    "below_range" when price has already broken past the last confirmed swing),
+    and ATR (volatility, for sanity-checking a stop distance). This is the
+    structural read that raw candles alone don't give you.
 
     These are documented heuristics, not validated signals — and Elliott Wave is
     NOT auto-counted (reliable auto-counting isn't feasible); use the returned
@@ -644,12 +649,65 @@ async def get_market_structure(
 
     Returns:
         dict with symbol, interval, trend, recent_structure_events, swings,
-        premium_discount, fair_value_gaps, order_blocks, liquidity, notes.
+        premium_discount, fair_value_gaps, order_blocks, liquidity, atr, notes.
     """
     swing_strength = max(1, min(swing_strength, 10))
     candles = await _fetch_klines(symbol, interval, limit)
     result = structure.analyze(candles, swing_strength=swing_strength)
     return {"symbol": symbol.upper(), "interval": interval, **result}
+
+
+@mcp.tool(annotations=_RO)
+async def get_top_down(
+    symbol: str = SYMBOL_DEFAULT,
+    swing_strength: int = 2,
+    daily_limit: int = 100,
+    h4_limit: int = 150,
+    h1_limit: int = 150,
+) -> dict:
+    """
+    Fetch and compute ICT/SMC structure for Daily, 4H, and 1H in one call —
+    matching the plan's top-down framework (Section 5): Daily sets the macro
+    trend/bias, 4H holds the Order Block/FVG/liquidity zone, 1H is where you
+    wait for the BOS/CHoCH entry trigger inside that zone. Saves three separate
+    get_market_structure round-trips at the start of a session.
+
+    Args:
+        symbol: Trading pair symbol, e.g. "BTCUSDT".
+        swing_strength: Fractal window for swing detection, applied to all
+            three timeframes (1-10, default 2).
+        daily_limit: Daily candles to analyze (default 100).
+        h4_limit: 4H candles to analyze (default 150).
+        h1_limit: 1H candles to analyze (default 150).
+
+    Returns:
+        dict with symbol, daily/h4/h1 (each shaped like get_market_structure:
+        interval, trend, recent_structure_events, swings, premium_discount,
+        fair_value_gaps, order_blocks, liquidity, atr), and a coaching note.
+    """
+    swing_strength = max(1, min(swing_strength, 10))
+
+    async def one(interval: str, limit: int) -> dict:
+        candles = await _fetch_klines(symbol, interval, limit)
+        return {"interval": interval,
+                **structure.analyze(candles, swing_strength=swing_strength)}
+
+    daily, h4, h1 = await asyncio.gather(
+        one("1d", daily_limit), one("4h", h4_limit), one("1h", h1_limit),
+    )
+
+    return {
+        "symbol": symbol.upper(),
+        "daily": daily,
+        "h4": h4,
+        "h1": h1,
+        "note": (
+            "Top-down read (plan Section 5): Daily trend sets bias, 4H holds "
+            "the OB/FVG/liquidity zone, 1H looks for the BOS/CHoCH entry "
+            "trigger inside it. Elliott Wave is not auto-counted on any "
+            "timeframe — use the swing points to count manually."
+        ),
+    }
 
 
 @mcp.tool(annotations=_PURE)

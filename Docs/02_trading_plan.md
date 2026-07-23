@@ -115,7 +115,7 @@ Always go highest → lowest timeframe. Never trade against the Daily trend.
 5. **Kill Zones** — London 07–09 UTC / NY 13–15 UTC.
 6. **Funding + Fear** — deeply negative funding = bullish pressure; Extreme Fear <20 = possible bottom.
 
-> Run this with your coach — **you** read it, the coach checks it.
+> Run this with your coach — **you** read it, the coach checks it. (The coach can pull all three timeframes at once via `get_top_down`.)
 
 ---
 

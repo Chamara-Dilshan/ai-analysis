@@ -16,7 +16,8 @@ alternative.me, CoinGecko market data endpoints ඔක්කොම public).
 | `get_open_interest` | Open interest (current + history) — positioning build/unwind බලන්න | Binance |
 | `get_long_short_ratio` | Top traders vs retail crowd long/short ratio — divergence signal | Binance |
 | `get_taker_volume` | Taker buy/sell volume ratio — aggressive order flow | Binance |
-| `get_market_structure` | ICT/SMC structure — swings, BOS/CHoCH, FVG, order blocks, liquidity, premium/discount | Binance (computed) |
+| `get_market_structure` | ICT/SMC structure — swings, BOS/CHoCH, FVG, order blocks, liquidity, premium/discount (dealing-range based), ATR | Binance (computed) |
+| `get_top_down` | Daily + 4H + 1H structure in one call — the plan's top-down framework | Binance (computed) |
 | `get_fear_greed_index` | Crypto Fear & Greed Index (0-100) + classification | alternative.me |
 | `get_market_overview` | Total market cap, BTC dominance, top N altcoins | CoinGecko |
 | `calculate_position_size` | Plan-compliant sizing + risk checks (2% risk, 5x lev, 1:2 R:R, Binance min, liquidation, fees) — pass/fail verdict | Local (plan math) |
@@ -30,6 +31,10 @@ feed එක **unofficial mirror** එකක් — schedule එක verify කර
 `get_market_structure` extra API call එකක් නෑ — klines වලින්ම (`structure.py`)
 locally compute කරනවා. මේවා **heuristic** ICT/SMC rules; validated signals නෙවෙයි,
 සහ Elliott Wave auto-count කරන්නේ නෑ (swings වලින් manual count කරන්න).
+premium/discount දැන් **current dealing range** එක (last swing low → last swing
+high) පාවිච්චි කරනවා පරණ whole-window range එකට වඩා — ICT definition එකට
+ගැලපෙන්න. ATR එකත් (volatility yardstick, stop distance sanity-check කරන්න)
+එකතු වුනා. `get_top_down` එකෙන් Daily+4H+1H තුනම එකවර ලබාගන්න පුළුවන්.
 
 `calculate_position_size` (`risk.py`) සහ `get_session_clock` දෙකම **network එකක්
 නෑ** — pure local. Sizing tool එක trading plan එකේ rules (2% risk, 5x leverage,
@@ -104,6 +109,25 @@ python -m pip install -r requirements-dev.txt   # one-time
 python -m pytest -q
 ```
 Tests ඔක්කොම pass වුනොත් `server.py` එක healthy.
+
+## 🔄 Live copy එක sync කරන්නේ මෙහෙම
+
+**වැදගත්**: Claude Desktop run කරන්නේ මේ source folder එකෙන් නෙවෙයි — වෙනම
+folder එකකින් (`C:\Users\chama\mcp-servers\binance-btc-futures`). මේ source
+එකේ (D:) වෙනසක් කළාට Desktop එකට automatic ලෙස පේන්නේ නෑ; restart කරන එකෙන්
+විතරක් වැඩක් වෙන්නෙත් නෑ — copy කරන්නත් ඕන.
+
+`server.py`/`risk.py`/`news.py`/`structure.py` වලින් එකක් හරි වෙනස් කළාට පස්සේ,
+මේ command එක run කරන්න (root එකේ ඉඳන්):
+
+```bash
+sync-to-live.cmd
+```
+
+මේකෙන්: වෙනස් වුන files ටික live folder එකට copy කරලා (පරණ `server.py` →
+`server.py.bak` ලෙස backup කරලා), live venv එකේම `pytest` run කරලා ok ද කියලා
+check කරනවා. **Tests fail උනොත් Desktop restart කරන්න එපා** — first ඒක fix
+කරන්න. Tests pass උනොත් විතරක් Desktop එක fully quit කරලා reopen කරන්න.
 
 ## 🔧 Troubleshooting
 

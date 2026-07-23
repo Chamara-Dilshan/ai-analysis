@@ -112,6 +112,71 @@ def test_premium_zone():
     pd = S.premium_discount(candles)
     assert pd["range_high"] == 20.0 and pd["range_low"] == 10.0
     assert pd["position_pct"] == 80.0 and pd["zone"] == "premium"
+    assert pd["range_source"] == "full_window"
+    assert pd["note"] is None
+
+
+def test_premium_discount_uses_dealing_range_over_full_window():
+    # An old, much wider candle (0-100) should NOT set the range once recent
+    # swings define a tighter current dealing range (60-70).
+    candles = [mk(0, 100, 40, 90), mk(1, 70, 60, 65), mk(2, 70, 60, 68)]
+    swings = [
+        {"index": 0, "time": "t0", "price": 60.0, "type": "low"},
+        {"index": 1, "time": "t1", "price": 70.0, "type": "high"},
+    ]
+    pd = S.premium_discount(candles, swings)
+    assert pd["range_source"] == "dealing_range"
+    assert pd["range_high"] == 70.0 and pd["range_low"] == 60.0
+    assert pd["position_pct"] == 80.0 and pd["zone"] == "premium"  # (68-60)/10
+    assert pd["note"] is None
+
+
+def test_premium_discount_below_range_when_swing_lags_price():
+    # Last confirmed swing low is 60, but price has since broken below it to 50
+    # (the new low hasn't fractal-confirmed as a swing yet) -> pct < 0.
+    candles = [mk(0, 70, 60, 65), mk(1, 65, 50, 52)]
+    swings = [
+        {"index": 0, "time": "t0", "price": 60.0, "type": "low"},
+        {"index": 0, "time": "t0", "price": 70.0, "type": "high"},
+    ]
+    pd = S.premium_discount(candles, swings)
+    assert pd["zone"] == "below_range"
+    assert pd["position_pct"] < 0
+    assert "BELOW" in pd["note"]
+
+
+def test_premium_discount_above_range_when_swing_lags_price():
+    candles = [mk(0, 70, 60, 65), mk(1, 80, 65, 78)]
+    swings = [
+        {"index": 0, "time": "t0", "price": 60.0, "type": "low"},
+        {"index": 0, "time": "t0", "price": 70.0, "type": "high"},
+    ]
+    pd = S.premium_discount(candles, swings)
+    assert pd["zone"] == "above_range"
+    assert pd["position_pct"] > 100
+    assert "ABOVE" in pd["note"]
+
+
+def test_premium_discount_falls_back_when_only_one_swing_type():
+    candles = [mk(0, 20, 10, 12), mk(1, 18, 14, 18)]
+    swings = [{"index": 0, "time": "t0", "price": 15.0, "type": "high"}]  # no low
+    pd = S.premium_discount(candles, swings)
+    assert pd["range_source"] == "full_window"
+    assert pd["range_high"] == 20.0 and pd["range_low"] == 10.0
+
+
+# --------------------------------------------------------------------------- #
+# ATR
+# --------------------------------------------------------------------------- #
+def test_atr_basic():
+    candles = [mk(0, 10, 8, 9), mk(1, 11, 8, 10), mk(2, 12, 9, 11)]
+    # TR(1)=max(3,|11-9|=2,|8-9|=1)=3 ; TR(2)=max(3,|12-10|=2,|9-10|=1)=3
+    assert S.atr(candles, period=2) == 3.0
+
+
+def test_atr_insufficient_candles_returns_none():
+    candles = [mk(0, 10, 8, 9), mk(1, 11, 9, 10)]
+    assert S.atr(candles, period=14) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -128,6 +193,7 @@ def test_analyze_end_to_end():
     assert out["candles_analyzed"] == 6
     assert out["recent_structure_events"]  # non-empty
     assert "premium_discount" in out and "liquidity" in out
+    assert "atr" in out and out["atr"]["value"] is None  # only 6 candles, period 14
 
 
 def test_analyze_too_few_candles():

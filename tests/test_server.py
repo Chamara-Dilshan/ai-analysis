@@ -88,6 +88,7 @@ EXPECTED_TOOLS = {
     "get_fear_greed_index", "get_market_overview", "get_open_interest",
     "get_long_short_ratio", "get_taker_volume", "get_market_structure",
     "calculate_position_size", "get_session_clock", "get_economic_calendar",
+    "get_top_down",
 }
 
 
@@ -301,8 +302,22 @@ async def test_get_market_structure(respx_mock):
     assert "error" not in d
     assert d["trend"] in {"up", "down", "none"}
     for section in ("recent_structure_events", "swings", "premium_discount",
-                    "fair_value_gaps", "order_blocks", "liquidity"):
+                    "fair_value_gaps", "order_blocks", "liquidity", "atr"):
         assert section in d
+
+
+async def test_get_top_down(respx_mock):
+    # Same klines payload backs all three timeframe fetches (respx matches by
+    # host+path only) — enough to prove the fan-out/merge wiring is correct.
+    _binance(respx_mock, "/fapi/v1/klines", KLINES_STRUCT)
+    d = await _call("get_top_down", {"swing_strength": 1})
+    assert d["symbol"] == "BTCUSDT"
+    assert "note" in d
+    for tf, interval in (("daily", "1d"), ("h4", "4h"), ("h1", "1h")):
+        assert d[tf]["interval"] == interval
+        assert "error" not in d[tf]
+        assert d[tf]["trend"] in {"up", "down", "none"}
+        assert "atr" in d[tf] and "premium_discount" in d[tf]
 
 
 # --------------------------------------------------------------------------- #
