@@ -21,9 +21,11 @@ alternative.me, CoinGecko market data endpoints ඔක්කොම public).
 | `get_market_overview` | Total market cap, BTC dominance, top N altcoins | CoinGecko |
 | `calculate_position_size` | Plan-compliant sizing + risk checks (2% risk, 5x lev, 1:2 R:R, Binance min, liquidation, fees) — pass/fail verdict | Local (plan math) |
 | `get_session_clock` | Current UTC time + London/NY kill-zone status for entry timing | Local (clock) |
+| `get_economic_calendar` | High-impact news blackout check (FOMC/CPI/NFP…) — "no trade 30 min around news" | ForexFactory (faireconomy.media) |
 
-alternative.me සහ CoinGecko දෙකම **free, no API key** — Binance වගේම public
-data endpoints.
+alternative.me, CoinGecko, සහ ForexFactory calendar feed (faireconomy.media)
+ඔක්කොම **free, no API key** — Binance වගේම public data endpoints. (Calendar
+feed එක **unofficial mirror** එකක් — schedule එක verify කරගන්න.)
 
 `get_market_structure` extra API call එකක් නෑ — klines වලින්ම (`structure.py`)
 locally compute කරනවා. මේවා **heuristic** ICT/SMC rules; validated signals නෙවෙයි,

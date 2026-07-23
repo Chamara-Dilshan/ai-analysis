@@ -8,12 +8,17 @@ Provides live market data to Claude for Elliott Wave + ICT + SMC analysis:
   order blocks, liquidity, premium/discount) — see structure.py
 - Crypto Fear & Greed Index (alternative.me)
 - Total market cap, BTC dominance, top altcoins (CoinGecko)
+- High-impact economic calendar for news blackouts (ForexFactory feed) — see news.py
+
+Plus two pure-local (no-network) helpers: a plan position-size/risk calculator
+(risk.py) and a UTC kill-zone session clock.
 
 All endpoints used are free public APIs — no API key needed for any of it.
 Docs:
 - Binance: https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data
 - Fear & Greed: https://alternative.me/crypto/fear-and-greed-index/
 - CoinGecko: https://docs.coingecko.com/reference/introduction
+- Economic calendar: ForexFactory weekly JSON via faireconomy.media (unofficial mirror)
 
 Reliability: every outbound call retries on 429/5xx and transient network
 errors with exponential backoff (honoring Retry-After), and slow-changing
@@ -31,12 +36,15 @@ from typing import Any, Optional
 import httpx
 from fastmcp import FastMCP
 
+import news
 import risk
 import structure
 
 BINANCE_BASE_URL = "https://fapi.binance.com"
 FNG_BASE_URL = "https://api.alternative.me"
 COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
+# ForexFactory weekly economic calendar (free public mirror, no API key; unofficial).
+FF_BASE_URL = "https://nfs.faireconomy.media"
 SYMBOL_DEFAULT = "BTCUSDT"
 
 # Sent on every request — CoinGecko in particular throttles UA-less traffic harder.
@@ -69,8 +77,9 @@ mcp = FastMCP(
         "premium/discount), the Crypto Fear & Greed Index, and a broader market "
         "overview (total market cap, BTC dominance, top altcoins) from CoinGecko. "
         "Also a position-size/risk calculator that enforces the $100 plan (2% "
-        "risk, 5x leverage, 1:2 R:R, Binance minimums) and a UTC session clock "
-        "for London/New York kill-zone timing. "
+        "risk, 5x leverage, 1:2 R:R, Binance minimums), a UTC session clock "
+        "for London/New York kill-zone timing, and a high-impact economic "
+        "calendar for news blackouts (no trading 30 min around FOMC/CPI/NFP etc.). "
         "Use these together for full Elliott Wave / ICT / SMC context, not just "
         "BTC futures in isolation."
     ),
@@ -776,6 +785,42 @@ async def get_session_clock() -> dict:
         the kill-zone windows, and a coaching note.
     """
     return _session_state(datetime.now(timezone.utc))
+
+
+@mcp.tool(annotations=_RO)
+async def get_economic_calendar(
+    currencies: str = "USD",
+    min_impact: str = "High",
+    within_minutes: int = 30,
+) -> dict:
+    """
+    Check this week's high-impact economic calendar for the "no high-impact news
+    within 30 min" rule (checklist item 7). Answers whether a qualifying release
+    (FOMC, CPI, NFP, PCE, PPI, etc.) falls inside a blackout window around now,
+    and lists what's coming up. BTC reacts mostly to USD macro, so the default
+    filter is USD / High impact.
+
+    Args:
+        currencies: Comma-separated currency codes to watch (default "USD";
+            e.g. "USD,EUR"). These are the event's currency, not a trading pair.
+        min_impact: Minimum impact to include — "High", "Medium", or "Low"
+            (default "High").
+        within_minutes: Blackout half-window in minutes around now (default 30).
+
+    Returns:
+        dict with now_utc, filter, blackout_active, news_clear, next_event,
+        upcoming (list), source, and a coaching note. Data is a free public
+        ForexFactory mirror (no API key) — verify against an official calendar.
+    """
+    raw = await _get(FF_BASE_URL, "/ff_calendar_thisweek.json", cache_ttl=900)
+    currs = tuple(c.strip() for c in currencies.split(",") if c.strip())
+    return news.analyze(
+        raw,
+        datetime.now(timezone.utc),
+        currencies=currs or ("USD",),
+        min_impact=min_impact,
+        within_minutes=within_minutes,
+    )
 
 
 if __name__ == "__main__":

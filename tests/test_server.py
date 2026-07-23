@@ -87,7 +87,7 @@ EXPECTED_TOOLS = {
     "get_btc_price", "get_funding_rate", "get_klines", "get_order_book",
     "get_fear_greed_index", "get_market_overview", "get_open_interest",
     "get_long_short_ratio", "get_taker_volume", "get_market_structure",
-    "calculate_position_size", "get_session_clock",
+    "calculate_position_size", "get_session_clock", "get_economic_calendar",
 }
 
 
@@ -357,3 +357,33 @@ async def test_get_session_clock_shape():
     assert isinstance(d["in_kill_zone"], bool)
     for key in ("utc_time", "utc_weekday", "kill_zones_utc", "note"):
         assert key in d
+
+
+# Far-future dates so the events are always "upcoming" regardless of run time.
+FF_CALENDAR = [
+    {"title": "Core CPI m/m", "country": "USD",
+     "date": "2099-01-15T13:30:00+00:00", "impact": "High",
+     "forecast": "0.3%", "previous": "0.2%"},
+    {"title": "ECB Press Conference", "country": "EUR",
+     "date": "2099-01-15T12:45:00+00:00", "impact": "High",
+     "forecast": "", "previous": ""},
+    {"title": "Wholesale Inventories m/m", "country": "USD",
+     "date": "2099-01-15T15:00:00+00:00", "impact": "Low",
+     "forecast": "", "previous": ""},
+]
+
+
+async def test_get_economic_calendar(respx_mock):
+    respx_mock.get(host="nfs.faireconomy.media",
+                   path="/ff_calendar_thisweek.json").mock(
+        return_value=httpx.Response(200, json=FF_CALENDAR)
+    )
+    d = await _call("get_economic_calendar", {"currencies": "USD",
+                                              "min_impact": "High"})
+    # Only the High-impact USD event passes the default filter.
+    titles = [e["title"] for e in d["upcoming"]]
+    assert titles == ["Core CPI m/m"]
+    assert d["next_event"]["title"] == "Core CPI m/m"
+    assert d["blackout_active"] is False
+    assert d["news_clear"] is True
+    assert d["filter"]["currencies"] == ["USD"]
