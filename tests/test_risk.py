@@ -39,6 +39,15 @@ def test_reward_risk_ratio():
     assert out["reward_risk_ratio"] == 2.0
 
 
+def test_rr_rounding_not_self_contradictory():
+    # Target $0.10 short of true 1:2 -> rr 1.9997, rounds to 2.00. The displayed
+    # ratio and the pass/fail must agree (no "2.00 is below 2:1" warning).
+    out = R.position_size(entry=65542.7, stop_loss=65200, take_profit=66228)
+    assert out["reward_risk_ratio"] == 2.0
+    assert not any("reward:risk" in w.lower() for w in out["warnings"])
+    assert out["passes_plan"] is True
+
+
 def test_rr_below_minimum_warns():
     out = R.position_size(entry=65000, stop_loss=64675, take_profit=65325)
     assert out["reward_risk_ratio"] == 1.0

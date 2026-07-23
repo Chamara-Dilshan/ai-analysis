@@ -85,11 +85,13 @@ def position_size(
         else:
             plan_targets[label] = round(entry - mult * sl_distance, 2)
 
-    # Reward:risk on the supplied target, if any.
+    # Reward:risk on the supplied target, if any. Rounded here so the check below
+    # judges the same number that's displayed (else e.g. 1.9997 shows as "2.00"
+    # yet fails the >= 2 rule — a self-contradictory message).
     rr: Optional[float] = None
     tp_side_ok = True
     if take_profit is not None and take_profit > 0:
-        rr = abs(take_profit - entry) / sl_distance
+        rr = round(abs(take_profit - entry) / sl_distance, 2)
         if direction == "long" and take_profit <= entry:
             tp_side_ok = False
         if direction == "short" and take_profit >= entry:
@@ -155,7 +157,7 @@ def position_size(
                 "5x": round(notional / 5, 2),
             },
         },
-        "reward_risk_ratio": round(rr, 2) if rr is not None else None,
+        "reward_risk_ratio": rr,
         "plan_target_prices": plan_targets,
         "fees": {
             "est_roundtrip_usd": round(fee_usd, 3),
