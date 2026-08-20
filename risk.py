@@ -1,5 +1,5 @@
 """
-Pure-Python position sizing & risk math for Chamara's $100 BTC plan.
+Pure-Python position sizing & risk math for Chamara's $200 BTC plan.
 
 No I/O, no third-party deps — every rule here is an explicit encoding of the
 trading plan (Docs/02_trading_plan.md, Section 2 & 4) so the numbers are
@@ -13,13 +13,14 @@ distance). That is the single thing the plan flags as a weakness.
 from typing import Optional
 
 # --- Plan constants (Docs/02_trading_plan.md) --- #
-MAX_RISK_PCT = 2.0          # hard cap: never risk more than 2% ($2 on $100)
+MAX_RISK_PCT = 2.0          # hard cap: never risk more than 2% ($4 on $200)
 MAX_LEVERAGE = 5.0          # hard cap: never above 5x
 MIN_RR = 2.0                # minimum 1:2 reward:risk
 
 # --- Binance BTCUSDT USDⓈ-M perpetual exchange filters (verify; they change) --- #
-# NOTE: the $100 min-notional floor is stricter than the ~$65 figure in the docs
-# and is the real binding constraint on a $100 account.
+# NOTE: this $100 min-notional floor is Binance's OWN exchange rule, not tied to
+# account size — it does not change with Chamara's capital. Still binding on a
+# $200 account with a small risk% or a tight stop.
 MIN_QTY_BTC = 0.001
 MIN_NOTIONAL_USD = 100.0
 DEFAULT_TAKER_FEE_PCT = 0.05   # per side (Binance USDⓈ-M taker, no BNB discount)
@@ -32,7 +33,7 @@ def position_size(
     entry: float,
     stop_loss: float,
     take_profit: Optional[float] = None,
-    capital: float = 100.0,
+    capital: float = 200.0,
     risk_pct: float = 1.0,
     leverage: float = 3.0,
     taker_fee_pct: float = DEFAULT_TAKER_FEE_PCT,
@@ -179,7 +180,7 @@ def position_size(
         "verdict": (
             "Sizing respects your plan — you still decide whether to take it."
             if passes else
-            "⚠️ Fix the warnings before trading. On $100, when the math "
+            "⚠️ Fix the warnings before trading. On $200, when the math "
             "doesn't fit cleanly, the disciplined move is usually to skip."
         ),
         "rules_checked": (

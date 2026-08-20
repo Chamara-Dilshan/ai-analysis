@@ -1,18 +1,18 @@
 # ₿ CHAMARA'S PERSONAL BITCOIN TRADING PLAN
-### Day + Swing Trading | $100 Capital | Elliott Wave + ICT + SMC
+### Day + Swing Trading | $200 Capital | Elliott Wave + ICT + SMC
 
 ---
 
 ## TRADER PROFILE
 - **Name:** Chamara
-- **Capital:** $100 USD
+- **Capital:** $200 USD
 - **Experience:** Intermediate
 - **Style:** Day Trading + Swing Trading
 - **Platform:** Binance Futures — BTCUSDT Perpetual
 - **Strategy:** SMC-primary (ICT/SMC), Elliott Wave as context only
 - **Weaknesses to guard:** SL discipline, leverage, FOMO, emotion
 
-> **MISSION: Grow $100 slowly through discipline — not prediction, not signals, not hope.**
+> **MISSION: Grow $200 slowly through discipline — not prediction, not signals, not hope.**
 
 ---
 
@@ -48,20 +48,20 @@ Trading is a business, not gambling. Your biggest asset is **discipline**, not t
 ---
 
 ## SECTION 2 — CAPITAL MANAGEMENT
-With $100, every dollar matters. One trade without a stop can end everything.
+With $200, every dollar still matters. One trade without a stop can end everything.
 
 | Per-Trade Risk | Daily Loss Limit | Max Open Trades |
 |---|---|---|
-| **MAX 2% ($2)** | **MAX 5% ($5)** | **MAX 2** |
+| **MAX 2% ($4)** | **MAX 5% ($10)** | **MAX 2** |
 
 **Position Size Formula**
 ```
 Position Value = (Capital × Risk%) / Stop-Loss Distance %
-Example: $100 × 1% = $1 risk;  SL = 0.5%  →  $1 / 0.005 = $200 position
-At 3x leverage: margin ≈ $200 / 3 ≈ $67
+Example: $200 × 1% = $2 risk;  SL = 0.5%  →  $2 / 0.005 = $400 position
+At 3x leverage: margin ≈ $400 / 3 ≈ $133
 ```
 
-**⚠️ Account-size warning:** On $100 this formula often produces positions below Binance's minimum — **0.001 BTC _and_ $100 notional**, whichever is larger — OR forces you to break your risk rule to meet it. If the math doesn't fit cleanly — **skip the trade.** Don't force size. (The `calculate_position_size` tool flags this automatically.)
+**⚠️ Account-size warning:** On $200 this formula can still produce positions below Binance's minimum — **0.001 BTC _and_ $100 notional**, whichever is larger (an exchange rule — it does not scale with your capital) — OR force you to break your risk rule to meet it. If the math doesn't fit cleanly — **skip the trade.** Don't force size. (The `calculate_position_size` tool flags this automatically.)
 
 **Leverage by condition**
 - Strong trend + clean setup → max 5x
@@ -134,9 +134,9 @@ Always go highest → lowest timeframe. Never trade against the Daily trend.
 ---
 
 ## SECTION 7 — EMERGENCY RULES
-- Daily loss > $5 (5%) → stop for the day.
-- Weekly loss > $10 (10%) → 3-day break.
-- Monthly loss > $20 (20%) → 1-week break + full review.
+- Daily loss > $10 (5%) → stop for the day.
+- Weekly loss > $20 (10%) → 3-day break.
+- Monthly loss > $40 (20%) → 1-week break + full review.
 
 **Revenge-trading warning — STOP the moment you think:**
 - "I need to recover this loss right now" → close the platform
@@ -171,7 +171,7 @@ I, Chamara, commit to:
 - NEVER risk more than 2% on a single trade.
 - NEVER use more than 5x leverage.
 - ALWAYS complete my journal after every trade.
-- STOP trading the moment my daily $5 loss limit is hit.
+- STOP trading the moment my daily $10 loss limit is hit.
 - NEVER enter out of FOMO, impatience, or emotion.
 - Treat every loss as a lesson — never a reason for revenge.
 - Use my coach to **pressure-test my own analysis** — and make my own decisions.

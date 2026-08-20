@@ -129,6 +129,36 @@ sync-to-live.cmd
 check කරනවා. **Tests fail උනොත් Desktop restart කරන්න එපා** — first ඒක fix
 කරන්න. Tests pass උනොත් විතරක් Desktop එක fully quit කරලා reopen කරන්න.
 
+## 🖥️ Standalone hourly monitor (Claude session එකෙන් independent)
+
+Chat session එක close කළත් (Claude Desktop පිටවුනත්) hourly BTC/ETH level check
+එක run වෙන්න ඕන නම්, `standalone_monitor.py` — Windows Task Scheduler එකෙන්
+hourly run වෙන, MCP/Claude එකක් හම්බ නොවෙන, fully independent script එකක්:
+
+- **Engine එකම reuse කරනවා**: `server._get`/`_fetch_klines` (retry/cache),
+  `structure.analyze` (ICT/SMC), `risk.position_size` (plan math) — logic
+  duplicate කරන්නේ නෑ, chat monitor එකේ underlying code එකම.
+- ⚠️ **වැදගත් වෙනසක්**: level-picking එක මෙතන **mechanical rule** එකක් —
+  price එකට ළඟම open bullish OB/FVG = support, recent 4H swing high/low
+  ම = bull/bear-confirm. Chat එකේදී මම දෙන judgment-based read එකට වඩා සරලයි —
+  first-pass screener එකක් විදිහට හිතන්න, alert එකක් ආවම full read එකක් chat
+  එකෙන්ම අහන්න.
+- **Output**: `monitor_log.txt` (හැම run එකකම එකතු වෙනවා — reliable source),
+  `latest_alert.txt` (trigger එකක් ආවොත් විතරක්), `monitor_state.json`
+  (internal — "already alerted" duplicate-alert වළක්වන්න).
+- **Notification**: native Windows toast එකක් try කරනවා (extra pip dependency
+  නෑ — PowerShell/WinRT හරහා) — **best-effort විතරයි**, OS notification
+  settings අනුව පේන්නත් පුළුවන් නොපේන්නත් පුළුවන්. `monitor_log.txt` එකයි
+  සැබෑ source of truth.
+
+**Task එක manage කරන්නේ මෙහෙම** (PowerShell):
+```powershell
+Get-ScheduledTaskInfo -TaskName "BTC-ETH-LevelMonitor"   # last run, next run, result
+Disable-ScheduledTask -TaskName "BTC-ETH-LevelMonitor"   # pause
+Enable-ScheduledTask -TaskName "BTC-ETH-LevelMonitor"    # resume
+Unregister-ScheduledTask -TaskName "BTC-ETH-LevelMonitor" -Confirm:$false  # remove entirely
+```
+
 ## 🔧 Troubleshooting
 
 | ගැටළුව | හේතුව / විසඳුම |

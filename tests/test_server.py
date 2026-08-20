@@ -326,21 +326,22 @@ async def test_get_top_down(respx_mock):
 # --------------------------------------------------------------------------- #
 async def test_calculate_position_size_long():
     d = await _call("calculate_position_size", {
-        "entry": 65000, "stop_loss": 64675, "capital": 100,
+        "entry": 65000, "stop_loss": 64675, "capital": 200,
         "risk_pct": 1, "leverage": 3,
     })
     assert d["direction"] == "long"
-    assert d["risk_amount_usd"] == 1.0
+    assert d["risk_amount_usd"] == 2.0
     assert d["stop_distance_pct"] == 0.5
-    assert d["position"]["notional_usd"] == 200.0
+    assert d["position"]["notional_usd"] == 400.0
     assert d["plan_target_prices"]["1:2"] == 65650.0
     assert d["passes_plan"] is True
 
 
 async def test_calculate_position_size_flags_undersized():
-    # A 2% stop on 1% risk -> ~$50 notional, below the $100 Binance minimum.
+    # $200 capital, 3% stop on 1% risk ($2) -> $66.67 notional, below the
+    # $100 Binance minimum (an exchange rule, not tied to account size).
     d = await _call("calculate_position_size", {
-        "entry": 65000, "stop_loss": 63700, "capital": 100, "risk_pct": 1,
+        "entry": 65000, "stop_loss": 63050, "capital": 200, "risk_pct": 1,
     })
     assert d["passes_plan"] is False
     assert any("minimum" in w.lower() for w in d["warnings"])

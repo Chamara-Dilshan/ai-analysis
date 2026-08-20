@@ -8,21 +8,21 @@ import risk as R
 
 
 def test_long_sizing_basic():
-    # $100, risk 1% ($1), stop 0.5% away -> $200 notional.
-    out = R.position_size(entry=65000, stop_loss=64675, capital=100,
+    # $200, risk 1% ($2), stop 0.5% away -> $400 notional.
+    out = R.position_size(entry=65000, stop_loss=64675, capital=200,
                           risk_pct=1, leverage=3)
     assert out["direction"] == "long"
-    assert out["risk_amount_usd"] == 1.0
+    assert out["risk_amount_usd"] == 2.0
     assert out["stop_distance_pct"] == 0.5
-    assert out["position"]["notional_usd"] == 200.0
-    assert out["position"]["size_btc"] == round(200 / 65000, 6)
-    assert out["position"]["margin_required_usd"] == round(200 / 3, 2)
+    assert out["position"]["notional_usd"] == 400.0
+    assert out["position"]["size_btc"] == round(400 / 65000, 6)
+    assert out["position"]["margin_required_usd"] == round(400 / 3, 2)
     assert out["passes_plan"] is True
     assert out["warnings"] == []
 
 
 def test_short_direction_inferred():
-    out = R.position_size(entry=65000, stop_loss=65325, capital=100, risk_pct=1)
+    out = R.position_size(entry=65000, stop_loss=65325, capital=200, risk_pct=1)
     assert out["direction"] == "short"
     assert out["plan_target_prices"]["1:2"] == 65000 - 2 * 325
 
@@ -62,15 +62,16 @@ def test_take_profit_wrong_side_warns():
 
 
 def test_undersized_position_warns():
-    # 2% stop on 1% risk -> $50 notional, below the $100 min notional.
-    out = R.position_size(entry=65000, stop_loss=63700, capital=100, risk_pct=1)
-    assert out["position"]["notional_usd"] == 50.0
+    # $200 capital, 3% stop on 1% risk ($2) -> $66.67 notional, below the $100
+    # min notional (Binance's own floor — doesn't move with account size).
+    out = R.position_size(entry=65000, stop_loss=63050, capital=200, risk_pct=1)
+    assert out["position"]["notional_usd"] == 66.67
     assert any("minimum" in w.lower() for w in out["warnings"])
     assert out["passes_plan"] is False
 
 
 def test_risk_over_cap_warns():
-    out = R.position_size(entry=65000, stop_loss=64675, capital=100, risk_pct=3)
+    out = R.position_size(entry=65000, stop_loss=64675, capital=200, risk_pct=3)
     assert any("exceeds your 2.0% hard cap" in w for w in out["warnings"])
     assert out["passes_plan"] is False
 
@@ -82,7 +83,7 @@ def test_leverage_over_cap_warns():
 
 def test_stop_beyond_liquidation_warns():
     # High leverage + a wide stop places the stop past the liq price.
-    out = R.position_size(entry=65000, stop_loss=58000, capital=100,
+    out = R.position_size(entry=65000, stop_loss=58000, capital=200,
                           risk_pct=2, leverage=10)
     assert any("liquidat" in w.lower() for w in out["warnings"])
     assert out["passes_plan"] is False

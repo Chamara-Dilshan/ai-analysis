@@ -28,6 +28,7 @@ Run locally via stdio (Claude Desktop). See README.md for setup.
 """
 
 import asyncio
+import os
 import random
 import time
 from datetime import datetime, timezone
@@ -40,7 +41,10 @@ import news
 import risk
 import structure
 
-BINANCE_BASE_URL = "https://fapi.binance.com"
+# Overridable so a headless host that Binance geo-blocks (e.g. a US-based CI
+# runner returning HTTP 451) can be pointed at a reachable mirror/proxy without
+# editing code. Default is unchanged — local runs behave exactly as before.
+BINANCE_BASE_URL = os.environ.get("BINANCE_BASE_URL", "https://fapi.binance.com")
 FNG_BASE_URL = "https://api.alternative.me"
 COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
 # ForexFactory weekly economic calendar (free public mirror, no API key; unofficial).
@@ -76,7 +80,7 @@ mcp = FastMCP(
         "structure (swings, BOS/CHoCH, FVGs, order blocks, liquidity, "
         "premium/discount), the Crypto Fear & Greed Index, and a broader market "
         "overview (total market cap, BTC dominance, top altcoins) from CoinGecko. "
-        "Also a position-size/risk calculator that enforces the $100 plan (2% "
+        "Also a position-size/risk calculator that enforces the $200 plan (2% "
         "risk, 5x leverage, 1:2 R:R, Binance minimums), a UTC session clock "
         "for London/New York kill-zone timing, and a high-impact economic "
         "calendar for news blackouts (no trading 30 min around FOMC/CPI/NFP etc.), "
@@ -715,7 +719,7 @@ async def calculate_position_size(
     entry: float,
     stop_loss: float,
     take_profit: Optional[float] = None,
-    capital: float = 100.0,
+    capital: float = 200.0,
     risk_pct: float = 1.0,
     leverage: float = 3.0,
 ) -> dict:
@@ -729,7 +733,7 @@ async def calculate_position_size(
     the plan's tiered target prices (1:2 / 1:3 / 1:4), an estimated round-trip
     fee, and a list of rule warnings with a pass/fail verdict. Use it for the
     "SL set before entry", "R:R ≥ 1:2", and position-sizing parts of the
-    checklist — and to catch a trade that is too small to place on $100 without
+    checklist — and to catch a trade that is too small to place on $200 without
     breaking the 2% rule (in which case the answer is: skip it).
 
     Remember: leverage changes only margin and the liquidation price, never your
@@ -739,7 +743,7 @@ async def calculate_position_size(
         entry: Planned entry price.
         stop_loss: Stop-loss price (invalidation). Must differ from entry.
         take_profit: Optional target price, for reward:risk.
-        capital: Account size in USD (default 100).
+        capital: Account size in USD (default 200).
         risk_pct: Percent of capital to risk (default 1%; hard cap is 2%).
         leverage: Leverage multiple (default 3x; hard cap is 5x).
 

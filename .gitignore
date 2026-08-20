@@ -17,3 +17,8 @@ env/
 # Claude Code local (machine-specific) settings & runtime locks
 .claude/settings.local.json
 .claude/*.lock
+
+# Monitor runtime files (machine-local, regenerated every run)
+monitor_state.json
+monitor_log.txt
+latest_alert.txt

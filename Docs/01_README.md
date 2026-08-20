@@ -1,5 +1,5 @@
 # ₿ CHAMARA'S BTC TRADING PROJECT
-### Capital: $100 | Platform: Binance Futures | Strategy: Elliott Wave + ICT + SMC
+### Capital: $200 | Platform: Binance Futures | Strategy: Elliott Wave + ICT + SMC
 
 ---
 
@@ -16,7 +16,7 @@
 ---
 
 ## 🎯 MISSION
-**Grow $100 slowly through discipline — not predictions, signals, or hope.**
+**Grow $200 slowly through discipline — not predictions, signals, or hope.**
 The coach checks your thinking. **You** make every decision.
 
 ---
@@ -24,13 +24,13 @@ The coach checks your thinking. **You** make every decision.
 ## 📊 CAPITAL TRACKER
 | Date | Capital | Change | Notes |
 |------|---------|--------|-------|
-| Start | $100 | — | Fresh start. Capital protection first. |
+| Start | $200 | — | Fresh start. Capital protection first. |
 | | | | |
 
 ---
 
 ## 🏆 REALISTIC TARGETS (honest version)
-> On a $100 futures account, fees and minimum order sizes are your biggest enemy — not the market. Treat the first months as **paid practice**, not income.
+> On a $200 futures account, fees and minimum order sizes are still your biggest enemy — not the market. Treat the first months as **paid practice**, not income.
 
 | Phase | Real Goal | Focus |
 |-------|-----------|-------|
@@ -45,9 +45,9 @@ The coach checks your thinking. **You** make every decision.
 
 ## ⚠️ GOLDEN RULES (Read Every Day)
 1. ALWAYS set Stop Loss before entry.
-2. NEVER risk more than 2% per trade ($2).
+2. NEVER risk more than 2% per trade ($4).
 3. NEVER use more than 5x leverage.
-4. Daily loss limit = $5 → STOP trading for the day.
+4. Daily loss limit = $10 → STOP trading for the day.
 5. NO trade without 3 confluence factors.
 6. Kill Zones only: London 07–09 UTC / NY 13–15 UTC.
 7. NO trading 30 min before/after high-impact news.
@@ -56,10 +56,10 @@ The coach checks your thinking. **You** make every decision.
 ---
 
 ## 💸 ACCOUNT REALITY (read this before every session)
-- Minimum order = **0.001 BTC _and_ $100 notional** (Binance's `MIN_NOTIONAL` filter) — whichever is larger binds. On a $100 account your smallest real position is ≈$100 of exposure (≈1× your whole capital in notional).
+- Minimum order = **0.001 BTC _and_ $100 notional** (Binance's `MIN_NOTIONAL` filter — an exchange rule, doesn't scale with your capital) — whichever is larger binds. On a $200 account your smallest real position is ≈$100 of exposure (≈half your whole capital in notional) — less extreme than at $100, but still large relative to a $4 risk.
 - Round-trip fees ≈ 0.08–0.10% of notional.
-- Trading several times a day = fees quietly eat most of a $2-risk trade.
-- **Fewer, cleaner trades beat many small ones on a $100 account.**
+- Trading several times a day = fees quietly eat most of a $4-risk trade.
+- **Fewer, cleaner trades beat many small ones on a $200 account.**
 - Let the coach's `calculate_position_size` tool check this — if a setup can't be sized within the 2% rule _and_ above the minimum, it tells you to skip.
 
 ---
