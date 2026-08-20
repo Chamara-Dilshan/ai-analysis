@@ -91,7 +91,11 @@ def send_telegram(message: str) -> None:
         if resp.status_code != 200:
             log(f"(telegram failed: HTTP {resp.status_code})")
     except Exception as e:
-        log(f"(telegram failed: {e})")
+        # The token is in the request URL, and some exception strings carry the
+        # URL. Scrub it — this log can end up in a CI run log or an uploaded
+        # artifact, which may be world-readable.
+        detail = str(e).replace(token, "<token>")
+        log(f"(telegram failed: {type(e).__name__}: {detail})")
 
 
 def show_toast(title: str, message: str) -> None:
