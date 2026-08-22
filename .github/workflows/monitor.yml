@@ -1,10 +1,20 @@
 name: BTC-ETH hourly monitor
 
 on:
-  schedule:
-    # Hourly at :07 UTC. GitHub queues scheduled runs best-effort — expect a
-    # few minutes' drift, and an occasionally skipped hour under platform load.
-    - cron: "7 * * * *"
+  # The hourly schedule is DELIBERATELY DISABLED. Binance refuses US IP
+  # addresses with HTTP 451, and GitHub-hosted runners are US-based with no
+  # way to choose a region — so every scheduled run fetched nothing. Worse, it
+  # exited 0 and showed a green check each time, because check_symbol catches
+  # per-symbol fetch errors; 19 consecutive runs looked healthy while logging
+  # only errors.
+  #
+  # The live monitor now runs hourly from an Oracle Cloud VM in Mumbai, where
+  # Binance responds normally. See sync-to-vm.ps1.
+  #
+  # Only re-enable this if BINANCE_BASE_URL is pointed at a mirror or proxy
+  # that a US host can actually reach:
+  #   schedule:
+  #     - cron: "7 * * * *"
   workflow_dispatch:
 
 # Never let two runs overlap and fight over the state cache.
