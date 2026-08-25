@@ -35,6 +35,7 @@ import httpx
 import server
 import structure
 import risk
+import news
 
 HERE = Path(__file__).parent
 STATE_PATH = HERE / "monitor_state.json"
@@ -61,6 +62,20 @@ CAPITAL, RISK_PCT, LEVERAGE = 200, 2, 5
 # INSIDE a band that thin at the moment an hourly check runs, so without this
 # filter the setup gate is unreachable in practice.
 MIN_ZONE_PCT = 0.35
+
+# Round-trip fees as a percent of the $4 risk. A very tight stop can make the
+# trade cost a fifth of what it risks, which quietly demands a much higher
+# win rate than the stated R:R suggests.
+MAX_FEE_PCT_OF_RISK = 10.0
+
+# Optional dead-man's switch. Point this at a healthchecks.io (or similar)
+# ping URL and the service alerts YOU when the monitor stops checking in —
+# the one failure a monitor can never report about itself. Inert if unset.
+HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "").strip()
+
+# Consecutive failed runs before the monitor complains about itself. Covers
+# the cases it CAN report: API outages, code faults, bad data.
+MAX_CONSECUTIVE_FAILURES = 3
 
 # One "still alive" message per day, so silence is never ambiguous: no
 # heartbeat means the monitor is down, not that the market is quiet.
@@ -231,6 +246,43 @@ def latest_event(struct: dict):
     return events[0] if events else None
 
 
+async def check_news_blackout(now_utc: datetime):
+    """Is a high-impact USD release inside the blackout window right now?
+
+    Returns (blocked, description). A calendar failure must never block a
+    setup — an unreachable third-party feed is not evidence of news, so this
+    fails OPEN and says so.
+    """
+    try:
+        raw = await server._get(
+            server.FF_BASE_URL, "/ff_calendar_thisweek.json", cache_ttl=900,
+        )
+        res = news.analyze(raw, now_utc, currencies=("USD",),
+                            min_impact="High", within_minutes=30)
+        if res.get("blackout_active"):
+            ev = res.get("next_event") or {}
+            label = ev.get("title") or ev.get("event") or "high-impact release"
+            return True, f"news blackout: {label}"
+        return False, "news clear"
+    except Exception as e:
+        return False, f"news check unavailable ({type(e).__name__})"
+
+
+def ping_healthcheck(ok: bool = True) -> None:
+    """Check in with an external dead-man's switch, if one is configured.
+
+    This is the only way to catch the failure the monitor cannot report
+    itself: the whole machine going away. Best-effort — a failed ping must
+    never affect the run."""
+    if not HEALTHCHECK_URL:
+        return
+    url = HEALTHCHECK_URL if ok else HEALTHCHECK_URL.rstrip("/") + "/fail"
+    try:
+        httpx.get(url, timeout=10)
+    except Exception as e:
+        log(f"(healthcheck ping failed: {type(e).__name__})")
+
+
 def is_newer(candidate, previous) -> bool:
     """True if candidate is a structure-event timestamp strictly newer than
     previous. Guards against the swing engine revising its "latest" event
@@ -256,13 +308,13 @@ def active_kill_zone(now_utc: datetime):
     return None
 
 
-def evaluate_setup(r: dict, now_utc: datetime):
+def evaluate_setup(r: dict, now_utc: datetime, news_blocked: bool = False):
     """Check the full entry checklist, not just whether a level moved.
 
     A crossed level is an event; a setup is an event that also happens to be
-    in the right direction, at the right price, at the right time. This
-    returns None unless every gate passes, plus a dict describing which gates
-    failed so a near-miss can still be logged usefully.
+    in the right direction, at the right price, at the right time, clear of
+    news, and cheap enough to be worth taking. Returns a dict describing
+    every gate so a near-miss is still legible in the log.
     """
     gates = {}
 
@@ -297,20 +349,38 @@ def evaluate_setup(r: dict, now_utc: datetime):
     kz = active_kill_zone(now_utc)
     gates["kill_zone"] = kz is not None
 
+    # Gate: no high-impact release inside the blackout window. The plan
+    # forbids trading through FOMC/CPI/NFP, where a stop is decoration.
+    gates["news_clear"] = not news_blocked
+
     if not all(gates.values()):
         return {"ready": False, "gates": gates, "direction": direction,
                 "zone": zone, "kill_zone": kz}
 
-    # Every gate passed — build the actual trade parameters. Stop goes just
-    # beyond the zone that is supposed to hold; if it does not hold, the
-    # reason for the trade is gone.
+    # Structural gates passed — build the trade. Stop goes just beyond the
+    # zone that is supposed to hold; if it does not hold, the reason for the
+    # trade is gone.
     if direction == "long":
         entry, stop = r["price"], round(zone["bottom"] * 0.999, 2)
     else:
         entry, stop = r["price"], round(zone["top"] * 1.001, 2)
 
-    return {"ready": True, "gates": gates, "direction": direction,
-            "zone": zone, "kill_zone": kz, "entry": entry, "stop": stop}
+    # Gate: fees must not eat the edge. A stop tight enough to make the
+    # round trip cost a large slice of the $4 risk is a trade that needs to
+    # be right far more often than the R:R implies.
+    fee_pct = None
+    try:
+        m = risk.position_size(entry=entry, stop_loss=stop, capital=CAPITAL,
+                                risk_pct=RISK_PCT, leverage=LEVERAGE)
+        fee_pct = m["fees"]["pct_of_risk"]
+        gates["fee_ok"] = fee_pct <= MAX_FEE_PCT_OF_RISK and m["passes_plan"]
+    except Exception:
+        # If the math will not compute, do not claim the setup is ready.
+        gates["fee_ok"] = False
+
+    return {"ready": all(gates.values()), "gates": gates,
+            "direction": direction, "zone": zone, "kill_zone": kz,
+            "entry": entry, "stop": stop, "fee_pct": fee_pct}
 
 
 def format_setup_alert(symbol: str, r: dict, setup: dict, now_utc: datetime) -> str:
@@ -423,6 +493,11 @@ async def main() -> None:
     alert_lines = []      # everything notable, for the log
     telegram_msgs = []    # only what is worth interrupting him for
     summary = []          # one line per symbol, for the daily heartbeat
+    failures = 0
+
+    # Checked once per run, not per symbol — the calendar is market-wide.
+    news_blocked, news_note = await check_news_blackout(now)
+    lines.append(f"  {news_note}")
 
     for symbol in SYMBOLS:
         sym_state = state.get(symbol, {})
@@ -431,6 +506,7 @@ async def main() -> None:
         except Exception as e:
             lines.append(f"{symbol}: ERROR fetching/analyzing - {e}")
             state[symbol] = sym_state
+            failures += 1
             continue
 
         price = r["price"]
@@ -469,7 +545,7 @@ async def main() -> None:
 
         # The part that actually answers "is there a trade?" — checked every
         # run, alerted only when every gate passes.
-        setup = evaluate_setup(r, now)
+        setup = evaluate_setup(r, now, news_blocked=news_blocked)
         gate_str = ",".join(k for k, v in setup["gates"].items() if v) or "none"
 
         if setup["ready"]:
@@ -553,14 +629,31 @@ async def main() -> None:
 
         state[symbol] = sym_state
 
+    # Self-reported failures: API outages, code faults, bad data. Alert once
+    # on crossing the threshold rather than every hour, so a long outage does
+    # not become its own spam problem.
+    all_failed = failures == len(SYMBOLS)
+    streak = state.get("consecutive_failures", 0) + 1 if all_failed else 0
+    state["consecutive_failures"] = streak
+    if all_failed and streak == MAX_CONSECUTIVE_FAILURES:
+        telegram_msgs.append(
+            f"MONITOR PROBLEM — {streak} consecutive failed runs.\n"
+            f"Both symbols failed to fetch or analyse. Levels are NOT being "
+            f"watched right now.\n"
+            f"Check: ssh to the VM, then tail -20 ~/trading-analysis/monitor_log.txt\n"
+            + footer(now)
+        )
+
     # One heartbeat a day. Without it, a dead monitor and a quiet market look
     # identical from the phone — which is exactly how 19 green-but-empty CI
     # runs went unnoticed.
     if now.hour == HEARTBEAT_HOUR_UTC and state.get("last_heartbeat") != now.date().isoformat():
+        health = "all good" if streak == 0 else f"WARNING: {streak} failed runs"
         telegram_msgs.append(
-            "Daily check-in — monitor is alive.\n\n"
+            f"Daily check-in — monitor is alive ({health}).\n\n"
             + "\n".join(summary)
-            + "\n\nNo setup alert today means no setup, not a failure.\n"
+            + f"\n\n{news_note}."
+            + "\nNo setup alert today means no setup, not a failure.\n"
             + footer(now)
         )
         state["last_heartbeat"] = now.date().isoformat()
@@ -581,6 +674,11 @@ async def main() -> None:
     for msg in telegram_msgs:
         send_telegram(msg)
         log("--- TELEGRAM ---\n" + msg)
+
+    # Last thing: check in with the external watchdog. If this stops
+    # arriving, the service tells Chamara — covering the one failure mode
+    # this process can never report on its own.
+    ping_healthcheck(ok=not all_failed)
 
 
 if __name__ == "__main__":

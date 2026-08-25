@@ -105,13 +105,39 @@ ZONE = {"top": 74482.8, "bottom": 73399.7}
 
 
 def test_setup_ready_when_every_gate_passes():
-    r, now = _result(74000.0, zone=ZONE)
+    # Entry near the top of the zone, so the stop is wide enough that fees
+    # stay a small fraction of the risk.
+    r, now = _result(74400.0, zone=ZONE)
     setup = m.evaluate_setup(r, now)
-    assert setup["ready"]
+    assert setup["ready"], setup["gates"]
     assert setup["direction"] == "long"
-    assert setup["entry"] == 74000.0
+    assert setup["entry"] == 74400.0
     # Stop sits just under the zone that is supposed to hold.
     assert setup["stop"] < ZONE["bottom"]
+
+
+def test_no_setup_when_fees_eat_the_risk():
+    # Entering at the zone floor makes the stop very tight; on a $200 account
+    # the round trip then costs a large slice of the $4 risked, which demands
+    # a far higher win rate than the stated R:R implies.
+    r, now = _result(74000.0, zone=ZONE)
+    setup = m.evaluate_setup(r, now)
+    assert not setup["ready"]
+    assert setup["gates"]["fee_ok"] is False
+    assert setup["fee_pct"] > m.MAX_FEE_PCT_OF_RISK
+
+
+def test_no_setup_during_a_news_blackout():
+    r, now = _result(74400.0, zone=ZONE)
+    setup = m.evaluate_setup(r, now, news_blocked=True)
+    assert not setup["ready"]
+    assert setup["gates"]["news_clear"] is False
+
+
+def test_news_gate_passes_when_calendar_is_clear():
+    r, now = _result(74400.0, zone=ZONE)
+    setup = m.evaluate_setup(r, now, news_blocked=False)
+    assert setup["gates"]["news_clear"] is True
 
 
 def test_no_setup_when_price_outside_zone():
@@ -151,7 +177,7 @@ def test_no_setup_outside_kill_zone():
 
 
 def test_alert_message_carries_the_numbers_that_matter():
-    r, now = _result(74000.0, zone=ZONE)
+    r, now = _result(74400.0, zone=ZONE)
     setup = m.evaluate_setup(r, now)
     msg = m.format_setup_alert("BTCUSDT", r, setup, now)
     for expected in ("SETUP READY", "BTCUSDT", "LONG", "Entry", "Stop",
