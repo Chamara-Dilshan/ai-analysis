@@ -22,3 +22,4 @@ env/
 monitor_state.json
 monitor_log.txt
 latest_alert.txt
+positions.json

@@ -183,3 +183,86 @@ def test_alert_message_carries_the_numbers_that_matter():
     for expected in ("SETUP READY", "BTCUSDT", "LONG", "Entry", "Stop",
                      "Size", "Targets", "breakeven", "NOT a recommendation"):
         assert expected in msg
+
+
+# --- open position management ---------------------------------------------
+
+def _pos(direction="long", entry=77200.0, stop=76780.0, **flags):
+    p = {"symbol": "BTCUSDT", "direction": direction, "entry": entry,
+         "stop": stop}
+    p.update(flags)
+    return p
+
+
+def _tick(price, ev_dir=None, ev_age_hours=1):
+    now = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)
+    r = {"price": price, "event_1h": None}
+    if ev_dir:
+        r["event_1h"] = {
+            "direction": ev_dir, "type": "CHoCH", "level": price,
+            "time": (now - timedelta(hours=ev_age_hours)).isoformat(),
+        }
+    return r, now
+
+
+def test_position_quiet_before_any_milestone():
+    pos = _pos()
+    r, now = _tick(77300.0)          # only ~0.24R
+    assert m.manage_position(pos, r, now) == []
+
+
+def test_position_flags_breakeven_at_1r():
+    pos = _pos()
+    r, now = _tick(77620.0)          # exactly 1R
+    msgs = m.manage_position(pos, r, now)
+    assert any("BREAKEVEN" in x for x in msgs)
+    assert pos["breakeven_done"]
+
+
+def test_position_breakeven_announced_only_once():
+    pos = _pos(breakeven_done=True)
+    r, now = _tick(77620.0)
+    assert not any("BREAKEVEN" in x for x in m.manage_position(pos, r, now))
+
+
+def test_position_flags_first_target_at_2r():
+    pos = _pos(breakeven_done=True)
+    r, now = _tick(78040.0)          # 2R
+    msgs = m.manage_position(pos, r, now)
+    assert any("1:2 TARGET" in x for x in msgs)
+    assert pos["partial_done"]
+
+
+def test_position_reports_stop_hit_and_closes():
+    pos = _pos()
+    r, now = _tick(76770.0)          # through the stop
+    msgs = m.manage_position(pos, r, now)
+    assert any("STOP HIT" in x for x in msgs)
+    assert pos["closed"]
+
+
+def test_position_warns_on_opposing_1h_signal():
+    pos = _pos()
+    r, now = _tick(77300.0, ev_dir="bearish")
+    msgs = m.manage_position(pos, r, now)
+    assert any("OPPOSING SIGNAL" in x for x in msgs)
+
+
+def test_position_ignores_a_signal_in_its_favour():
+    pos = _pos()
+    r, now = _tick(77300.0, ev_dir="bullish")
+    assert not any("OPPOSING" in x for x in m.manage_position(pos, r, now))
+
+
+def test_position_opposing_warning_rearms_after_structure_turns_back():
+    pos = _pos(opposing_flagged=True)
+    favourable, now = _tick(77300.0, ev_dir="bullish")
+    m.manage_position(pos, favourable, now)
+    assert pos["opposing_flagged"] is False
+
+
+def test_short_position_milestones_run_the_other_way():
+    pos = _pos(direction="short", entry=77200.0, stop=77620.0)
+    r, now = _tick(76780.0)          # 1R in profit for a short
+    msgs = m.manage_position(pos, r, now)
+    assert any("BREAKEVEN" in x for x in msgs)

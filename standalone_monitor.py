@@ -39,6 +39,7 @@ import news
 
 HERE = Path(__file__).parent
 STATE_PATH = HERE / "monitor_state.json"
+POSITIONS_PATH = HERE / "positions.json"
 LOG_PATH = HERE / "monitor_log.txt"
 ALERT_PATH = HERE / "latest_alert.txt"
 
@@ -244,6 +245,102 @@ def latest_event(struct: dict):
     direction and not just timing."""
     events = struct.get("recent_structure_events") or []
     return events[0] if events else None
+
+
+def load_positions() -> list:
+    if POSITIONS_PATH.exists():
+        try:
+            return json.loads(POSITIONS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def save_positions(positions: list) -> None:
+    POSITIONS_PATH.write_text(json.dumps(positions, indent=2), encoding="utf-8")
+
+
+def manage_position(pos: dict, r: dict, now_utc: datetime):
+    """Watch an open trade against the plan's management rules.
+
+    The plan says: move to breakeven at 1R, take half at 1:2, and exit on an
+    opposing signal rather than waiting for the stop. Those are easy to state
+    and easy to forget at 3am, which is the whole reason to automate them.
+
+    Mutates pos to record what has already been announced, and returns a list
+    of messages worth sending.
+    """
+    msgs = []
+    price = r["price"]
+    entry, stop = pos["entry"], pos["stop"]
+    long = pos["direction"] == "long"
+    risk_dist = abs(entry - stop)
+    if risk_dist <= 0:
+        return msgs
+
+    profit = (price - entry) if long else (entry - price)
+    r_mult = profit / risk_dist
+
+    # Stop breached. Reported, not second-guessed — the exchange has almost
+    # certainly closed this already.
+    hit_stop = price <= stop if long else price >= stop
+    if hit_stop and not pos.get("closed"):
+        pos["closed"] = True
+        msgs.append(
+            f"STOP HIT — {pos['symbol']} {pos['direction'].upper()}\n"
+            f"Price ${price} reached your stop {stop}.\n"
+            f"Planned loss was ${round(CAPITAL * RISK_PCT / 100, 2)} "
+            f"({RISK_PCT}% of capital). That is the system working, not a "
+            f"failure.\nRemoved from tracking.\n{footer(now_utc)}"
+        )
+        return msgs
+
+    # 1R — the stop should come to breakeven so the trade cannot turn into a
+    # loser from here.
+    if r_mult >= 1 and not pos.get("breakeven_done"):
+        pos["breakeven_done"] = True
+        msgs.append(
+            f"MOVE STOP TO BREAKEVEN — {pos['symbol']} {pos['direction'].upper()}\n"
+            f"Price ${price} is 1R from entry {entry}.\n"
+            f"Move your stop to {entry}. From here the trade cannot lose.\n"
+            f"{footer(now_utc)}"
+        )
+
+    # 1:2 — the plan's first target.
+    if r_mult >= 2 and not pos.get("partial_done"):
+        pos["partial_done"] = True
+        target = round(entry + 2 * risk_dist, 2) if long else round(entry - 2 * risk_dist, 2)
+        msgs.append(
+            f"1:2 TARGET REACHED — {pos['symbol']} {pos['direction'].upper()}\n"
+            f"Price ${price} hit {target} ({round(r_mult, 2)}R).\n"
+            f"Plan: take half off here, trail the rest behind each new 1H swing.\n"
+            f"{footer(now_utc)}"
+        )
+
+    # Opposing 1H signal — the plan's exit-early rule. Announced once, and
+    # re-armed if structure turns back in favour, so a chopping 1H does not
+    # produce a stream of identical warnings.
+    ev = r.get("event_1h")
+    if ev:
+        against = "bearish" if long else "bullish"
+        opposing = ev["direction"] == against
+        try:
+            fresh = (now_utc - datetime.fromisoformat(ev["time"])) <= TRIGGER_MAX_AGE
+        except Exception:
+            fresh = False
+        if opposing and fresh and not pos.get("opposing_flagged"):
+            pos["opposing_flagged"] = True
+            msgs.append(
+                f"OPPOSING SIGNAL — {pos['symbol']} {pos['direction'].upper()}\n"
+                f"1H printed a {ev['direction']} {ev['type']} at {ev['level']}.\n"
+                f"Currently {round(r_mult, 2)}R. Your plan says exit on an "
+                f"opposing 1H signal rather than waiting for the stop.\n"
+                f"{footer(now_utc)}"
+            )
+        elif not opposing:
+            pos["opposing_flagged"] = False
+
+    return msgs
 
 
 async def check_news_blackout(now_utc: datetime):
@@ -494,6 +591,7 @@ async def main() -> None:
     telegram_msgs = []    # only what is worth interrupting him for
     summary = []          # one line per symbol, for the daily heartbeat
     failures = 0
+    positions = load_positions()
 
     # Checked once per run, not per symbol — the calendar is market-wide.
     news_blocked, news_note = await check_news_blackout(now)
@@ -545,6 +643,14 @@ async def main() -> None:
 
         # The part that actually answers "is there a trade?" — checked every
         # run, alerted only when every gate passes.
+        # An open trade outranks hunting for a new one — managing what you
+        # already hold is where the plan's rules actually get broken.
+        for pos in positions:
+            if pos["symbol"] == symbol and not pos.get("closed"):
+                for msg in manage_position(pos, r, now):
+                    telegram_msgs.append(msg)
+                    alert_lines.append(f"[POSITION] {msg.splitlines()[0]}")
+
         setup = evaluate_setup(r, now, news_blocked=news_blocked)
         gate_str = ",".join(k for k, v in setup["gates"].items() if v) or "none"
 
@@ -658,6 +764,10 @@ async def main() -> None:
         )
         state["last_heartbeat"] = now.date().isoformat()
 
+    # Stopped-out trades drop off the list; everything else keeps its flags
+    # so a milestone is announced once, not every hour.
+    save_positions([p for p in positions if not p.get("closed")])
+
     lines.append(footer(now))
     log("\n".join(lines))
     save_state(state)
@@ -681,7 +791,68 @@ async def main() -> None:
     ping_healthcheck(ok=not all_failed)
 
 
+def cli(argv) -> int:
+    """Manage tracked positions. Kept in this file so the VM has one script
+    to deploy, not two that can drift apart."""
+    usage = (
+        "usage:\n"
+        "  standalone_monitor.py                        run the hourly check\n"
+        "  standalone_monitor.py list                   show tracked trades\n"
+        "  standalone_monitor.py add SYM long|short ENTRY STOP\n"
+        "  standalone_monitor.py close SYM\n"
+    )
+    if not argv:
+        return -1
+
+    cmd, rest = argv[0], argv[1:]
+    positions = load_positions()
+
+    if cmd == "list":
+        if not positions:
+            print("No tracked positions.")
+        for p in positions:
+            flags = [k for k in ("breakeven_done", "partial_done") if p.get(k)]
+            print(f"{p['symbol']} {p['direction']} entry {p['entry']} "
+                  f"stop {p['stop']} {'[' + ','.join(flags) + ']' if flags else ''}")
+        return 0
+
+    if cmd == "add" and len(rest) == 4:
+        sym, direction, entry, stop = rest[0].upper(), rest[1].lower(), float(rest[2]), float(rest[3])
+        if direction not in ("long", "short"):
+            print("direction must be long or short")
+            return 2
+        # A long's stop belongs below entry and a short's above. Catching this
+        # here beats discovering it from a nonsensical alert later.
+        if (direction == "long" and stop >= entry) or (direction == "short" and stop <= entry):
+            print(f"stop {stop} is on the wrong side of entry {entry} for a {direction}")
+            return 2
+        positions = [p for p in positions if p["symbol"] != sym]
+        positions.append({"symbol": sym, "direction": direction, "entry": entry,
+                           "stop": stop, "opened": datetime.now(timezone.utc).isoformat()})
+        save_positions(positions)
+        risk_dist = abs(entry - stop)
+        print(f"Tracking {sym} {direction} entry {entry} stop {stop}.")
+        print(f"Breakeven alert at {round(entry + risk_dist, 2) if direction == 'long' else round(entry - risk_dist, 2)} (1R), "
+              f"1:2 at {round(entry + 2 * risk_dist, 2) if direction == 'long' else round(entry - 2 * risk_dist, 2)}.")
+        return 0
+
+    if cmd == "close" and len(rest) == 1:
+        sym = rest[0].upper()
+        remaining = [p for p in positions if p["symbol"] != sym]
+        if len(remaining) == len(positions):
+            print(f"No tracked position for {sym}.")
+            return 1
+        save_positions(remaining)
+        print(f"Stopped tracking {sym}.")
+        return 0
+
+    print(usage)
+    return 2
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        raise SystemExit(cli(sys.argv[1:]))
     try:
         asyncio.run(main())
     except Exception as e:
