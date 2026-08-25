@@ -92,9 +92,16 @@ def simulate(candles_1h, start_idx, direction, entry, stop, max_hours=240):
     return "open", 0.0, max_hours
 
 
-async def backtest(symbol: str, months: int):
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=30 * months)
+async def backtest(symbol: str, months: int, start_date=None, end_date=None):
+    """start_date/end_date make an out-of-sample run possible: the tuning was
+    done on the most recent 18 months, so testing on an earlier window is the
+    only way to tell a real edge from a fitted one."""
+    if start_date and end_date:
+        start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
+        end = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
+    else:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=30 * months)
     # Warm-up so the very first evaluation has as much history behind it as
     # the live monitor would.
     fetch_start = start - timedelta(days=60)
@@ -201,11 +208,15 @@ async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--months", type=int, default=6)
     ap.add_argument("--symbol", default=None)
+    ap.add_argument("--start", default=None, help="YYYY-MM-DD, out-of-sample")
+    ap.add_argument("--end", default=None, help="YYYY-MM-DD")
     args = ap.parse_args()
 
+    if args.start:
+        print(f"OUT-OF-SAMPLE WINDOW {args.start} to {args.end}")
     symbols = [args.symbol.upper()] if args.symbol else mon.SYMBOLS
     for sym in symbols:
-        trades, gates, bars = await backtest(sym, args.months)
+        trades, gates, bars = await backtest(sym, args.months, args.start, args.end)
         report(sym, trades, gates, bars)
 
 

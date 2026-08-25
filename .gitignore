@@ -26,3 +26,4 @@ positions.json
 
 # Credentials for the cloud VM - must never be committed
 monitor.env
+paper_trades.json

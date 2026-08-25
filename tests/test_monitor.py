@@ -300,3 +300,79 @@ def test_reached_zone_uses_the_hours_range_not_just_the_close():
 
 def test_reached_zone_handles_missing_zone():
     assert not m.reached_zone(None, 79000.0)
+
+
+# --- paper journal ---------------------------------------------------------
+
+def _paper(direction="long", entry=74400.0, stop=73326.3, fee_pct=6.0):
+    setup = {"direction": direction, "entry": entry, "stop": stop,
+             "fee_pct": fee_pct}
+    return m.record_paper_trade("BTCUSDT", setup, datetime(2026, 8, 24, 14, 0,
+                                                            tzinfo=timezone.utc))
+
+
+def test_paper_trade_records_a_1to2_target():
+    t = _paper()
+    assert t["status"] == "open"
+    # 2R above entry for a long.
+    assert t["target"] == round(74400.0 + 2 * (74400.0 - 73326.3), 2)
+
+
+def test_paper_trade_stays_open_while_price_is_between():
+    t = _paper()
+    now = datetime(2026, 8, 24, 15, 0, tzinfo=timezone.utc)
+    assert not m.update_paper_trade(t, {"price": 74800.0, "bar_low": 74500.0,
+                                        "bar_high": 74900.0}, now)
+    assert t["status"] == "open"
+
+
+def test_paper_trade_resolves_as_a_win_and_charges_fees():
+    t = _paper()
+    now = datetime(2026, 8, 24, 18, 0, tzinfo=timezone.utc)
+    assert m.update_paper_trade(t, {"price": 76600.0, "bar_low": 75000.0,
+                                    "bar_high": 76600.0}, now)
+    assert t["status"] == "win"
+    assert t["r"] == 2.0 - 0.06          # gross 2R minus the round trip
+
+
+def test_paper_trade_resolves_as_a_loss():
+    t = _paper()
+    now = datetime(2026, 8, 24, 16, 0, tzinfo=timezone.utc)
+    assert m.update_paper_trade(t, {"price": 73300.0, "bar_low": 73000.0,
+                                    "bar_high": 74400.0}, now)
+    assert t["status"] == "loss"
+    assert t["r"] == -1.0 - 0.06
+
+
+def test_paper_trade_counts_a_bar_covering_both_as_a_loss():
+    # Pessimistic: without tick data there is no way to know which came first.
+    t = _paper()
+    now = datetime(2026, 8, 24, 16, 0, tzinfo=timezone.utc)
+    m.update_paper_trade(t, {"price": 74400.0, "bar_low": 73000.0,
+                             "bar_high": 77000.0}, now)
+    assert t["status"] == "loss"
+
+
+def test_paper_trade_does_not_reopen_once_closed():
+    t = _paper()
+    now = datetime(2026, 8, 24, 16, 0, tzinfo=timezone.utc)
+    m.update_paper_trade(t, {"price": 73300.0, "bar_low": 73000.0,
+                             "bar_high": 74400.0}, now)
+    assert not m.update_paper_trade(t, {"price": 76600.0, "bar_low": 76000.0,
+                                        "bar_high": 76600.0}, now)
+    assert t["status"] == "loss"
+
+
+def test_paper_summary_reports_the_running_record():
+    trades = [
+        {"symbol": "BTCUSDT", "status": "win", "r": 1.94},
+        {"symbol": "BTCUSDT", "status": "loss", "r": -1.06},
+        {"symbol": "ETHUSDT", "status": "open"},
+    ]
+    out = m.paper_summary(trades)
+    assert "2 resolved" in out and "1 wins" in out and "1 still open" in out
+
+
+def test_paper_summary_before_anything_resolves():
+    assert "no trades resolved yet" in m.paper_summary(
+        [{"symbol": "BTCUSDT", "status": "open"}])

@@ -40,6 +40,7 @@ import news
 HERE = Path(__file__).parent
 STATE_PATH = HERE / "monitor_state.json"
 POSITIONS_PATH = HERE / "positions.json"
+PAPER_PATH = HERE / "paper_trades.json"
 LOG_PATH = HERE / "monitor_log.txt"
 ALERT_PATH = HERE / "latest_alert.txt"
 
@@ -279,6 +280,81 @@ def latest_event(struct: dict):
     direction and not just timing."""
     events = struct.get("recent_structure_events") or []
     return events[0] if events else None
+
+
+def load_paper() -> list:
+    if PAPER_PATH.exists():
+        try:
+            return json.loads(PAPER_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def save_paper(trades: list) -> None:
+    PAPER_PATH.write_text(json.dumps(trades, indent=2), encoding="utf-8")
+
+
+def record_paper_trade(symbol: str, setup: dict, now_utc: datetime) -> dict:
+    """Log every SETUP READY as a paper trade, whether or not it gets taken.
+
+    Backtests are arguments; this is evidence. It accumulates an untuned,
+    forward-looking record at zero risk, which is the only honest way to find
+    out whether the gates are worth acting on.
+    """
+    entry, stop = setup["entry"], setup["stop"]
+    risk_dist = abs(entry - stop)
+    long = setup["direction"] == "long"
+    return {
+        "symbol": symbol,
+        "direction": setup["direction"],
+        "entry": entry,
+        "stop": stop,
+        "target": round(entry + 2 * risk_dist, 2) if long else round(entry - 2 * risk_dist, 2),
+        "fee_pct": setup.get("fee_pct"),
+        "opened": now_utc.isoformat(),
+        "status": "open",
+    }
+
+
+def update_paper_trade(t: dict, r: dict, now_utc: datetime) -> bool:
+    """Resolve an open paper trade against the hour's range. Returns True if
+    it closed on this pass. Stop is checked first, so a bar covering both
+    stop and target counts as a loss — the pessimistic reading."""
+    if t["status"] != "open":
+        return False
+    lo = r.get("bar_low") or r["price"]
+    hi = r.get("bar_high") or r["price"]
+    long = t["direction"] == "long"
+
+    hit_stop = lo <= t["stop"] if long else hi >= t["stop"]
+    hit_target = hi >= t["target"] if long else lo <= t["target"]
+
+    if hit_stop:
+        t.update(status="loss", r=-1.0 - (t.get("fee_pct") or 0) / 100,
+                 closed=now_utc.isoformat())
+        return True
+    if hit_target:
+        t.update(status="win", r=2.0 - (t.get("fee_pct") or 0) / 100,
+                 closed=now_utc.isoformat())
+        return True
+    return False
+
+
+def paper_summary(trades: list) -> str:
+    """Plain-language scoreboard of the forward record so far."""
+    done = [t for t in trades if t["status"] in ("win", "loss")]
+    if not done:
+        open_n = sum(1 for t in trades if t["status"] == "open")
+        return f"Paper record: no trades resolved yet ({open_n} open)."
+    wins = [t for t in done if t["status"] == "win"]
+    total_r = sum(t.get("r", 0) for t in done)
+    return (
+        f"Paper record: {len(done)} resolved, {len(wins)} wins "
+        f"({100 * len(wins) / len(done):.0f}%), {total_r:+.1f}R "
+        f"(${total_r * CAPITAL * RISK_PCT / 100:+.2f} at your sizing). "
+        f"{sum(1 for t in trades if t['status'] == 'open')} still open."
+    )
 
 
 def load_positions() -> list:
@@ -628,6 +704,7 @@ async def main() -> None:
     summary = []          # one line per symbol, for the daily heartbeat
     failures = 0
     positions = load_positions()
+    paper = load_paper()
 
     # Checked once per run, not per symbol — the calendar is market-wide.
     news_blocked, news_note = await check_news_blackout(now)
@@ -679,6 +756,13 @@ async def main() -> None:
 
         # The part that actually answers "is there a trade?" — checked every
         # run, alerted only when every gate passes.
+        # Resolve any open paper trades for this symbol against the hour.
+        for t in paper:
+            if t["symbol"] == symbol and update_paper_trade(t, r, now):
+                alert_lines.append(
+                    f"[PAPER] {symbol} {t['direction']} -> {t['status']} "
+                    f"({t.get('r', 0):+.2f}R)")
+
         # An open trade outranks hunting for a new one — managing what you
         # already hold is where the plan's rules actually get broken.
         for pos in positions:
@@ -704,6 +788,7 @@ async def main() -> None:
             # the alerts, which defeats the point.
             if key != last_key or stale:
                 telegram_msgs.append(format_setup_alert(symbol, r, setup, now))
+                paper.append(record_paper_trade(symbol, setup, now))
                 sym_state["last_setup_key"] = key
                 sym_state["last_setup_at"] = now.isoformat()
             alert_lines.append(f"[SETUP READY] {symbol} {setup['direction']}")
@@ -803,6 +888,7 @@ async def main() -> None:
     # Stopped-out trades drop off the list; everything else keeps its flags
     # so a milestone is announced once, not every hour.
     save_positions([p for p in positions if not p.get("closed")])
+    save_paper(paper)
 
     lines.append(footer(now))
     log("\n".join(lines))
@@ -842,6 +928,7 @@ def cli(argv) -> int:
 
     cmd, rest = argv[0], argv[1:]
     positions = load_positions()
+    paper = load_paper()
 
     if cmd == "list":
         if not positions:
