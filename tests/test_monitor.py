@@ -162,10 +162,18 @@ def test_no_setup_when_trigger_points_the_wrong_way():
 
 
 def test_no_setup_when_trigger_is_stale():
-    r, now = _result(74000.0, zone=ZONE, ev_age_hours=9)
+    # Older than TRIGGER_MAX_AGE (12h) — the 1H turn is history, not a signal.
+    r, now = _result(74000.0, zone=ZONE, ev_age_hours=20)
     setup = m.evaluate_setup(r, now)
     assert not setup["ready"]
     assert setup["gates"]["trigger"] is False
+
+
+def test_trigger_still_counts_just_inside_the_window():
+    # Backtesting showed a 3h window passed 0 times in 4,320 hours; this
+    # guards the widened bound so it cannot silently tighten again.
+    r, now = _result(74400.0, zone=ZONE, ev_age_hours=11)
+    assert m.evaluate_setup(r, now)["gates"]["trigger"] is True
 
 
 def test_no_setup_outside_kill_zone():
@@ -266,3 +274,29 @@ def test_short_position_milestones_run_the_other_way():
     r, now = _tick(76780.0)          # 1R in profit for a short
     msgs = m.manage_position(pos, r, now)
     assert any("BREAKEVEN" in x for x in msgs)
+
+
+# --- zone reachability (the bug the backtest found) ------------------------
+
+def test_reached_zone_is_proximity_not_containment():
+    # Open zones are open BECAUSE price has not returned to them, so a
+    # containment test can never pass. Price just above the zone counts.
+    zone = {"top": 77728.4, "bottom": 76857.1}
+    assert m.reached_zone(zone, 77800.0)
+
+
+def test_reached_zone_false_when_price_is_far_away():
+    zone = {"top": 77728.4, "bottom": 76857.1}
+    assert not m.reached_zone(zone, 79500.0)
+
+
+def test_reached_zone_uses_the_hours_range_not_just_the_close():
+    # Price dipped into the zone during the hour and closed well above it.
+    # A close-only test misses this; the trade was available.
+    zone = {"top": 77728.4, "bottom": 76857.1}
+    assert not m.reached_zone(zone, 79000.0)
+    assert m.reached_zone(zone, 79000.0, low=77500.0, high=79100.0)
+
+
+def test_reached_zone_handles_missing_zone():
+    assert not m.reached_zone(None, 79000.0)

@@ -50,9 +50,11 @@ SL_OFFSET = timedelta(hours=5, minutes=30)
 KILL_ZONES = (("London", 7, 9), ("New York", 13, 15))
 
 # How recent a 1H structure event must be to count as "the trigger" rather
-# than old history. Three 1H candles keeps it current without demanding the
-# alert land in the same hour the trigger printed.
-TRIGGER_MAX_AGE = timedelta(hours=3)
+# than old history. Backtesting showed 3h was far too tight — structure
+# events are rarer than that, so the gate passed 0 times in 4,320 hours.
+# Half a day keeps the signal current while letting price take its time
+# reaching the zone after the turn.
+TRIGGER_MAX_AGE = timedelta(hours=12)
 
 # Capital plan — must match risk.py's defaults and the MCP server.
 CAPITAL, RISK_PCT, LEVERAGE = 200, 2, 5
@@ -63,6 +65,16 @@ CAPITAL, RISK_PCT, LEVERAGE = 200, 2, 5
 # INSIDE a band that thin at the moment an hourly check runs, so without this
 # filter the setup gate is unreachable in practice.
 MIN_ZONE_PCT = 0.35
+
+# How close price must get to a zone to count as having reached it.
+#
+# This cannot be a containment test. Zones in the "open" list are open
+# precisely BECAUSE price has not traded back into them — the moment it does,
+# the engine marks them mitigated and they leave the list. So "price inside an
+# open zone" is self-contradictory and was true 0 times in 4,320 backtested
+# hours. Proximity is what the trade actually needs anyway: price arriving at
+# the zone edge, not sitting in its middle.
+ZONE_TOUCH_PCT = 0.25
 
 # Round-trip fees as a percent of the $4 risk. A very tight stop can make the
 # trade cost a fifth of what it risks, which quietly demands a much higher
@@ -194,12 +206,15 @@ def wide_enough(top: float, bottom: float, price: float) -> bool:
 
 
 def pick_demand_zone(struct_4h: dict, price: float):
+    # Zones AT or below price: bottom <= price. The old test was top < price,
+    # which selected only zones entirely beneath the current price — so the
+    # "is price inside the zone" gate could never be true, by construction.
     zones = []
     for ob in struct_4h["order_blocks"]["open"]:
-        if ob["type"] == "bullish" and ob["top"] < price:
+        if ob["type"] == "bullish" and ob["bottom"] <= price:
             zones.append((ob["top"], ob["bottom"]))
     for fvg in struct_4h["fair_value_gaps"]["open"]:
-        if fvg["type"] == "bullish" and fvg["top"] < price:
+        if fvg["type"] == "bullish" and fvg["bottom"] <= price:
             zones.append((fvg["top"], fvg["bottom"]))
     zones = [z for z in zones if wide_enough(z[0], z[1], price)]
     if not zones:
@@ -211,18 +226,37 @@ def pick_demand_zone(struct_4h: dict, price: float):
 def pick_supply_zone(struct_4h: dict, price: float):
     """Mirror of pick_demand_zone — nearest bearish OB/FVG above price, for
     when the higher timeframes are aligned short."""
+    # Mirror of pick_demand_zone: zones AT or above price, so price can be
+    # inside one rather than always strictly beneath it.
     zones = []
     for ob in struct_4h["order_blocks"]["open"]:
-        if ob["type"] == "bearish" and ob["bottom"] > price:
+        if ob["type"] == "bearish" and ob["top"] >= price:
             zones.append((ob["top"], ob["bottom"]))
     for fvg in struct_4h["fair_value_gaps"]["open"]:
-        if fvg["type"] == "bearish" and fvg["bottom"] > price:
+        if fvg["type"] == "bearish" and fvg["top"] >= price:
             zones.append((fvg["top"], fvg["bottom"]))
     zones = [z for z in zones if wide_enough(z[0], z[1], price)]
     if not zones:
         return None
     top, bottom = min(zones, key=lambda z: z[1])
     return {"top": top, "bottom": bottom}
+
+
+def reached_zone(zone, price: float, low: float = None, high: float = None) -> bool:
+    """Has price arrived at this zone within the last hour?
+
+    Tests the hour's RANGE against the zone, not just the close. Price often
+    tags a zone and leaves inside the same hour; a close-only test misses
+    those entirely, which understates how often the setup is really available.
+    See ZONE_TOUCH_PCT for why this is proximity rather than containment.
+    """
+    if not zone or not price:
+        return False
+    tol = price * ZONE_TOUCH_PCT / 100
+    lo = low if low is not None else price
+    hi = high if high is not None else price
+    # Range overlap between the hour's travel and the zone (plus tolerance).
+    return lo <= (zone["top"] + tol) and hi >= (zone["bottom"] - tol)
 
 
 def pick_bull_confirm(struct_4h: dict):
@@ -425,8 +459,8 @@ def evaluate_setup(r: dict, now_utc: datetime, news_blocked: bool = False):
     # Gate: price is in the 4H zone we care about. For longs that is a
     # bullish OB/FVG below price (discount); shorts are the mirror.
     zone = r["demand"] if direction == "long" else r["supply"]
-    in_zone = bool(zone and zone["bottom"] <= r["price"] <= zone["top"])
-    gates["in_zone"] = in_zone
+    gates["in_zone"] = reached_zone(zone, r["price"],
+                                     r.get("bar_low"), r.get("bar_high"))
 
     # Gate: the 1H has actually turned inside that zone. Arriving at a level
     # proves nothing on its own — this is the trigger.
@@ -550,6 +584,8 @@ async def check_symbol(symbol: str) -> dict:
         "trend_1d": struct_1d.get("trend"),
         "trend_4h": struct_4h.get("trend"),
         "trend_1h": struct_1h.get("trend"),
+        "bar_low": candles_1h[-1]["low"] if candles_1h else None,
+        "bar_high": candles_1h[-1]["high"] if candles_1h else None,
         "event_1h": latest_event(struct_1h),
         "supply": pick_supply_zone(struct_4h, price),
         "demand": pick_demand_zone(struct_4h, price),
