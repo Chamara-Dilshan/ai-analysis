@@ -33,7 +33,7 @@ def test_pick_demand_zone_skips_micro_gap_for_real_one():
         ]},
     }
     zone = m.pick_demand_zone(struct, 79215.3)
-    assert zone == {"top": 74482.8, "bottom": 73399.7}
+    assert zone == {"top": 74482.8, "bottom": 73399.7, "kind": "fvg"}
 
 
 def test_pick_demand_zone_returns_none_when_all_too_thin():

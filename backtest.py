@@ -169,10 +169,47 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None):
                 "stop": setup["stop"], "outcome": outcome,
                 "r": rr - fee_r if outcome != "open" else 0.0,
                 "gross_r": rr, "fee_r": fee_r, "hours": hours,
+                "session": mon.active_kill_zone(now),
+                "zone_kind": (setup["zone"] or {}).get("kind"),
+                # Where in the 4H range the entry happened. Low = deep
+                # discount for a long; high = deep premium for a short.
+                "range_pct": (st4h.get("premium_discount") or {}).get("position_pct"),
+                "weekday": now.strftime("%a"),
             })
             busy_until = i + hours
 
     return trades, gate_hits, sum(1 for t in t1h if t >= begin_ms)
+
+
+def breakdown(trades, key, label):
+    """Slice resolved trades by one attribute. Pure diagnosis of data we
+    already have — no new parameters, so no new chance to overfit."""
+    done = [t for t in trades if t["outcome"] in ("win", "loss")]
+    if not done:
+        return
+    buckets = {}
+    for t in done:
+        buckets.setdefault(t.get(key), []).append(t)
+    print(f"\n  by {label}:")
+    for name, group in sorted(buckets.items(), key=lambda kv: str(kv[0])):
+        w = sum(1 for t in group if t["outcome"] == "win")
+        total = sum(t["r"] for t in group)
+        print(f"    {str(name):12s} n={len(group):3d}  win {100*w/len(group):5.1f}%  "
+              f"{total:+6.1f}R  exp {total/len(group):+.2f}R")
+
+
+def depth_bucket(t):
+    """Coarse buckets for how far into the range the entry sat."""
+    v = t.get("range_pct")
+    if v is None:
+        return "unknown"
+    if v < 25:
+        return "deep-disc"
+    if v < 50:
+        return "discount"
+    if v < 75:
+        return "premium"
+    return "deep-prem"
 
 
 def report(symbol, trades, gate_hits, bars):
@@ -198,8 +235,15 @@ def report(symbol, trades, gate_hits, bars):
         print(f"  win rate {100 * len(wins) / resolved:.1f}%")
         print(f"  total {total_r:+.1f}R, expectancy {total_r / resolved:+.2f}R/trade")
         print(f"  on $200 at 2% risk: {total_r * 4:+.2f} USD")
+    for t in trades:
+        t["depth"] = depth_bucket(t)
+    breakdown(trades, "direction", "direction")
+    breakdown(trades, "session", "session")
+    breakdown(trades, "zone_kind", "zone type")
+    breakdown(trades, "depth", "entry depth in 4H range")
+
     print("\n  date              dir    entry      stop    result   hrs")
-    for t in trades[-15:]:
+    for t in trades[-5:]:
         print(f"  {t['time']}  {t['direction']:5s} {t['entry']:9.1f} "
               f"{t['stop']:9.1f}  {t['outcome']:7s} {t['hours']:4d}")
 

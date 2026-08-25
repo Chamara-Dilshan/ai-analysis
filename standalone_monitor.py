@@ -213,15 +213,15 @@ def pick_demand_zone(struct_4h: dict, price: float):
     zones = []
     for ob in struct_4h["order_blocks"]["open"]:
         if ob["type"] == "bullish" and ob["bottom"] <= price:
-            zones.append((ob["top"], ob["bottom"]))
+            zones.append((ob["top"], ob["bottom"], "ob"))
     for fvg in struct_4h["fair_value_gaps"]["open"]:
         if fvg["type"] == "bullish" and fvg["bottom"] <= price:
-            zones.append((fvg["top"], fvg["bottom"]))
+            zones.append((fvg["top"], fvg["bottom"], "fvg"))
     zones = [z for z in zones if wide_enough(z[0], z[1], price)]
     if not zones:
         return None
-    top, bottom = max(zones, key=lambda z: z[0])
-    return {"top": top, "bottom": bottom}
+    top, bottom, kind = max(zones, key=lambda z: z[0])
+    return {"top": top, "bottom": bottom, "kind": kind}
 
 
 def pick_supply_zone(struct_4h: dict, price: float):
@@ -232,15 +232,15 @@ def pick_supply_zone(struct_4h: dict, price: float):
     zones = []
     for ob in struct_4h["order_blocks"]["open"]:
         if ob["type"] == "bearish" and ob["top"] >= price:
-            zones.append((ob["top"], ob["bottom"]))
+            zones.append((ob["top"], ob["bottom"], "ob"))
     for fvg in struct_4h["fair_value_gaps"]["open"]:
         if fvg["type"] == "bearish" and fvg["top"] >= price:
-            zones.append((fvg["top"], fvg["bottom"]))
+            zones.append((fvg["top"], fvg["bottom"], "fvg"))
     zones = [z for z in zones if wide_enough(z[0], z[1], price)]
     if not zones:
         return None
-    top, bottom = min(zones, key=lambda z: z[1])
-    return {"top": top, "bottom": bottom}
+    top, bottom, kind = min(zones, key=lambda z: z[1])
+    return {"top": top, "bottom": bottom, "kind": kind}
 
 
 def reached_zone(zone, price: float, low: float = None, high: float = None) -> bool:
