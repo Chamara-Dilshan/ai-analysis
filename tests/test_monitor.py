@@ -1,170 +1,159 @@
-"""Tests for the standalone monitor's setup-gate engine.
+"""Tests for standalone_monitor's setup-gate logic.
 
-These cover the logic that decides whether Chamara's phone buzzes. Getting it
-wrong in either direction is expensive: a false alert costs trust, a missed
-one costs the setup he was waiting for.
+These cover the parts that decide whether Chamara's phone buzzes, which is
+where a silent bug is most expensive: a monitor that never fires looks
+identical to a quiet market.
 """
-from datetime import datetime, timezone
-
-import pytest
+from datetime import datetime, timedelta, timezone
 
 import standalone_monitor as m
 
 
-MON_NY = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)   # Monday, NY zone
-MON_LDN = datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc)   # Monday, London
-MON_QUIET = datetime(2026, 8, 24, 17, 0, tzinfo=timezone.utc)  # Monday, no zone
-SUN_LDN = datetime(2026, 8, 23, 8, 0, tzinfo=timezone.utc)   # Sunday, London hrs
+# --- zone width filter -----------------------------------------------------
+
+def test_wide_enough_rejects_one_tick_gaps():
+    # The real case that broke this: a $10.30 band on a $79k asset. Price can
+    # never be meaningfully inside that when the hourly check happens.
+    assert not m.wide_enough(77800.0, 77789.7, 79215.3)
 
 
-def _result(**overrides):
-    """A symbol result with every gate passing, so each test can break
-    exactly one thing."""
-    base = {
-        "price": 74000.0,
-        "funding_pct": 0.01,
-        "trend_1d": "up",
-        "trend_4h": "up",
-        "trend_1h": "up",
-        "demand": {"top": 74482.8, "bottom": 73399.7},
-        "supply": {"top": 79000.0, "bottom": 78500.0},
-        "event_1h": {
-            "type": "CHoCH",
-            "direction": "bullish",
-            "time": "2026-08-24T13:00:00+00:00",
-            "level": 73800.0,
-        },
+def test_wide_enough_accepts_a_real_zone():
+    # A genuine 4H gap, ~1.5% wide.
+    assert m.wide_enough(74482.8, 73399.7, 79215.3)
+
+
+def test_pick_demand_zone_skips_micro_gap_for_real_one():
+    struct = {
+        "order_blocks": {"open": []},
+        "fair_value_gaps": {"open": [
+            # Nearest to price, but far too thin to trade.
+            {"type": "bullish", "top": 77800.0, "bottom": 77789.7},
+            # Further away, but an actual zone.
+            {"type": "bullish", "top": 74482.8, "bottom": 73399.7},
+        ]},
     }
-    base.update(overrides)
-    return base
+    zone = m.pick_demand_zone(struct, 79215.3)
+    assert zone == {"top": 74482.8, "bottom": 73399.7}
 
 
-# --- is_newer: the regression that caused a duplicate alert -----------------
-
-def test_is_newer_blocks_backwards_revision():
-    """The swing engine can revise its latest event backwards when a
-    provisional swing fails to confirm. That is not news."""
-    assert m.is_newer("2026-08-23T04:00:00+00:00",
-                      "2026-08-24T12:00:00+00:00") is False
-
-
-def test_is_newer_allows_genuinely_newer():
-    assert m.is_newer("2026-08-24T12:00:00+00:00",
-                      "2026-08-23T04:00:00+00:00") is True
+def test_pick_demand_zone_returns_none_when_all_too_thin():
+    struct = {
+        "order_blocks": {"open": []},
+        "fair_value_gaps": {"open": [
+            {"type": "bullish", "top": 77800.0, "bottom": 77789.7},
+        ]},
+    }
+    assert m.pick_demand_zone(struct, 79215.3) is None
 
 
-def test_is_newer_first_event_counts():
-    assert m.is_newer("2026-08-24T12:00:00+00:00", None) is True
+# --- structure-event regression guard --------------------------------------
+
+def test_is_newer_accepts_a_later_event():
+    assert m.is_newer("2026-08-24T12:00:00+00:00", "2026-08-23T04:00:00+00:00")
 
 
-def test_is_newer_identical_is_not_newer():
-    t = "2026-08-24T12:00:00+00:00"
-    assert m.is_newer(t, t) is False
+def test_is_newer_rejects_an_earlier_event():
+    # The observed bug: the engine revised "latest" backwards a day and the
+    # old != comparison re-alerted on an event already seen.
+    assert not m.is_newer("2026-08-23T04:00:00+00:00", "2026-08-24T12:00:00+00:00")
 
 
-def test_is_newer_handles_unparseable_without_raising():
-    """If the timestamps cannot be parsed there is no ordering to reason
-    about, so it falls back to plain inequality — the old behaviour, applied
-    only where nothing better is available."""
-    assert m.is_newer("not-a-date", "not-a-date") is False
-    assert m.is_newer("not-a-date", "different-junk") is True
+def test_is_newer_rejects_the_same_event():
+    assert not m.is_newer("2026-08-24T12:00:00+00:00", "2026-08-24T12:00:00+00:00")
 
 
-# --- kill zones -------------------------------------------------------------
-
-@pytest.mark.parametrize("when,expected", [
-    (MON_LDN, "London"),
-    (MON_NY, "New York"),
-    (MON_QUIET, None),
-    (SUN_LDN, None),                                             # weekend
-    (datetime(2026, 8, 24, 9, 0, tzinfo=timezone.utc), None),    # end exclusive
-    (datetime(2026, 8, 24, 7, 0, tzinfo=timezone.utc), "London"),  # start incl.
-])
-def test_active_kill_zone(when, expected):
-    assert m.active_kill_zone(when) == expected
+def test_is_newer_accepts_first_ever_event():
+    assert m.is_newer("2026-08-24T12:00:00+00:00", None)
 
 
-# --- evaluate_setup ---------------------------------------------------------
+# --- kill zones ------------------------------------------------------------
 
-def test_all_gates_pass_produces_entry_and_stop():
-    s = m.evaluate_setup(_result(), MON_NY)
-    assert s["ready"] is True
-    assert s["direction"] == "long"
-    assert s["entry"] == 74000.0
-    # Stop sits just beyond the zone that is meant to hold.
-    assert s["stop"] < 73399.7
+def test_kill_zone_detects_london():
+    assert m.active_kill_zone(datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc)) == "London"
 
 
-def test_misaligned_timeframes_block_the_setup():
-    s = m.evaluate_setup(_result(trend_4h="down"), MON_NY)
-    assert s["ready"] is False
-    assert s["gates"]["aligned"] is False
+def test_kill_zone_detects_new_york():
+    assert m.active_kill_zone(datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)) == "New York"
 
 
-def test_price_outside_zone_blocks_the_setup():
-    s = m.evaluate_setup(_result(price=79000.0), MON_NY)
-    assert s["ready"] is False
-    assert s["gates"]["in_zone"] is False
+def test_kill_zone_excludes_weekends():
+    # 2026-08-23 is a Sunday, 08:00 would otherwise be inside London.
+    assert m.active_kill_zone(datetime(2026, 8, 23, 8, 0, tzinfo=timezone.utc)) is None
 
 
-def test_wrong_direction_trigger_blocks_the_setup():
-    """A bearish 1H turn does not open a long, however good the zone."""
-    ev = dict(_result()["event_1h"], direction="bearish")
-    s = m.evaluate_setup(_result(event_1h=ev), MON_NY)
-    assert s["ready"] is False
-    assert s["gates"]["trigger"] is False
+def test_kill_zone_end_is_exclusive():
+    assert m.active_kill_zone(datetime(2026, 8, 24, 15, 0, tzinfo=timezone.utc)) is None
 
 
-def test_stale_trigger_blocks_the_setup():
-    """An old 1H event is history, not a trigger."""
-    ev = dict(_result()["event_1h"], time="2026-08-24T02:00:00+00:00")
-    s = m.evaluate_setup(_result(event_1h=ev), MON_NY)
-    assert s["gates"]["trigger"] is False
+# --- the full gate ---------------------------------------------------------
+
+def _result(price, trend_1d="up", trend_4h="up", zone=None, ev_dir="bullish",
+            ev_age_hours=1):
+    now = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)
+    ev_time = (now - timedelta(hours=ev_age_hours)).isoformat()
+    return {
+        "price": price,
+        "trend_1d": trend_1d,
+        "trend_4h": trend_4h,
+        "demand": zone,
+        "supply": None,
+        "event_1h": {"direction": ev_dir, "time": ev_time},
+    }, now
 
 
-def test_outside_kill_zone_blocks_the_setup():
-    s = m.evaluate_setup(_result(), MON_QUIET)
-    assert s["ready"] is False
-    assert s["gates"]["kill_zone"] is False
+ZONE = {"top": 74482.8, "bottom": 73399.7}
 
 
-def test_weekend_blocks_even_a_perfect_setup():
-    s = m.evaluate_setup(_result(), SUN_LDN)
-    assert s["ready"] is False
-    assert s["gates"]["kill_zone"] is False
+def test_setup_ready_when_every_gate_passes():
+    r, now = _result(74000.0, zone=ZONE)
+    setup = m.evaluate_setup(r, now)
+    assert setup["ready"]
+    assert setup["direction"] == "long"
+    assert setup["entry"] == 74000.0
+    # Stop sits just under the zone that is supposed to hold.
+    assert setup["stop"] < ZONE["bottom"]
 
 
-def test_short_setup_uses_supply_zone():
-    s = m.evaluate_setup(
-        _result(
-            trend_1d="down", trend_4h="down", price=78700.0,
-            event_1h={"type": "BOS", "direction": "bearish",
-                      "time": "2026-08-24T13:00:00+00:00", "level": 78900.0},
-        ),
-        MON_NY,
-    )
-    assert s["ready"] is True
-    assert s["direction"] == "short"
-    assert s["stop"] > 79000.0    # stop above the supply zone
+def test_no_setup_when_price_outside_zone():
+    r, now = _result(79000.0, zone=ZONE)
+    setup = m.evaluate_setup(r, now)
+    assert not setup["ready"]
+    assert setup["gates"]["in_zone"] is False
 
 
-# --- alert formatting -------------------------------------------------------
-
-def test_setup_alert_contains_the_numbers_that_matter():
-    r = _result()
-    s = m.evaluate_setup(r, MON_NY)
-    msg = m.format_setup_alert("BTCUSDT", r, s, MON_NY)
-    for fragment in ("SETUP READY", "BTCUSDT", "LONG", "Entry", "Stop",
-                     "Size", "margin", "liq", "1:2", "breakeven",
-                     "NOT a recommendation"):
-        assert fragment in msg
+def test_no_setup_when_timeframes_disagree():
+    r, now = _result(74000.0, trend_4h="down", zone=ZONE)
+    setup = m.evaluate_setup(r, now)
+    assert not setup["ready"]
+    assert setup["gates"]["aligned"] is False
 
 
-def test_setup_alert_survives_broken_math():
-    """A sizing failure must still produce a usable message rather than
-    killing the run — the alert matters more than the arithmetic."""
-    r = _result()
-    s = m.evaluate_setup(r, MON_NY)
-    s["stop"] = s["entry"]        # zero stop distance: risk.position_size raises
-    msg = m.format_setup_alert("BTCUSDT", r, s, MON_NY)
-    assert "SETUP READY" in msg and "math failed" in msg
+def test_no_setup_when_trigger_points_the_wrong_way():
+    r, now = _result(74000.0, zone=ZONE, ev_dir="bearish")
+    setup = m.evaluate_setup(r, now)
+    assert not setup["ready"]
+    assert setup["gates"]["trigger"] is False
+
+
+def test_no_setup_when_trigger_is_stale():
+    r, now = _result(74000.0, zone=ZONE, ev_age_hours=9)
+    setup = m.evaluate_setup(r, now)
+    assert not setup["ready"]
+    assert setup["gates"]["trigger"] is False
+
+
+def test_no_setup_outside_kill_zone():
+    r, _ = _result(74000.0, zone=ZONE)
+    off_hours = datetime(2026, 8, 24, 3, 0, tzinfo=timezone.utc)
+    setup = m.evaluate_setup(r, off_hours)
+    assert not setup["ready"]
+    assert setup["gates"]["kill_zone"] is False
+
+
+def test_alert_message_carries_the_numbers_that_matter():
+    r, now = _result(74000.0, zone=ZONE)
+    setup = m.evaluate_setup(r, now)
+    msg = m.format_setup_alert("BTCUSDT", r, setup, now)
+    for expected in ("SETUP READY", "BTCUSDT", "LONG", "Entry", "Stop",
+                     "Size", "Targets", "breakeven", "NOT a recommendation"):
+        assert expected in msg

@@ -55,6 +55,13 @@ TRIGGER_MAX_AGE = timedelta(hours=3)
 # Capital plan — must match risk.py's defaults and the MCP server.
 CAPITAL, RISK_PCT, LEVERAGE = 200, 2, 5
 
+# Minimum zone width, as a percent of price. The raw structure engine emits
+# one-tick gaps — a $10 band on a $79k asset — and "nearest zone below price"
+# picks those far more often than real ones. Price can never be meaningfully
+# INSIDE a band that thin at the moment an hourly check runs, so without this
+# filter the setup gate is unreachable in practice.
+MIN_ZONE_PCT = 0.35
+
 # One "still alive" message per day, so silence is never ambiguous: no
 # heartbeat means the monitor is down, not that the market is quiet.
 HEARTBEAT_HOUR_UTC = 6
@@ -163,6 +170,13 @@ def footer(now_utc: datetime) -> str:
     )
 
 
+def wide_enough(top: float, bottom: float, price: float) -> bool:
+    """Reject one-tick gaps. See MIN_ZONE_PCT."""
+    if not price:
+        return False
+    return ((top - bottom) / price) * 100 >= MIN_ZONE_PCT
+
+
 def pick_demand_zone(struct_4h: dict, price: float):
     zones = []
     for ob in struct_4h["order_blocks"]["open"]:
@@ -171,6 +185,7 @@ def pick_demand_zone(struct_4h: dict, price: float):
     for fvg in struct_4h["fair_value_gaps"]["open"]:
         if fvg["type"] == "bullish" and fvg["top"] < price:
             zones.append((fvg["top"], fvg["bottom"]))
+    zones = [z for z in zones if wide_enough(z[0], z[1], price)]
     if not zones:
         return None
     top, bottom = max(zones, key=lambda z: z[0])
@@ -187,6 +202,7 @@ def pick_supply_zone(struct_4h: dict, price: float):
     for fvg in struct_4h["fair_value_gaps"]["open"]:
         if fvg["type"] == "bearish" and fvg["bottom"] > price:
             zones.append((fvg["top"], fvg["bottom"]))
+    zones = [z for z in zones if wide_enough(z[0], z[1], price)]
     if not zones:
         return None
     top, bottom = min(zones, key=lambda z: z[1])
