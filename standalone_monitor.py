@@ -15,6 +15,18 @@ chat analysis applies —
 Treat this as a first-pass screener. When it fires, go ask Claude for the
 full multi-timeframe read rather than trusting this alone.
 
+Two independent setup gates run every hour, either of which can fire on its
+own (added 2026-08-29, see evaluate_setup / evaluate_trend_continuation_setup):
+  - reversal:     wait for a pullback into a demand/supply zone, tight stop.
+  - continuation: enter on a fresh trend-aligned 4H BOS immediately, no
+                   pullback wait, wider stop at the breakout candle's own
+                   low/high. Added after backtesting showed the reversal-only
+                   gate missed almost the entire 2026-08-19->08-28 rally.
+                   6-month backtest (`backtest.py --mode continuation`):
+                   +0.79R/trade BTC, +0.45R/trade ETH, both directions
+                   profitable — see crypto-analysis-output-format memory for
+                   the full numbers.
+
 State persists in monitor_state.json so a fresh hourly process only alerts on
 a NEW condition, not a still-standing one (mirrors the chat monitor's
 behavior). Every run appends to monitor_log.txt — that file is the reliable
@@ -295,23 +307,30 @@ def save_paper(trades: list) -> None:
     PAPER_PATH.write_text(json.dumps(trades, indent=2), encoding="utf-8")
 
 
-def record_paper_trade(symbol: str, setup: dict, now_utc: datetime) -> dict:
+def record_paper_trade(symbol: str, setup: dict, now_utc: datetime,
+                        mode: str = "reversal") -> dict:
     """Log every SETUP READY as a paper trade, whether or not it gets taken.
 
     Backtests are arguments; this is evidence. It accumulates an untuned,
     forward-looking record at zero risk, which is the only honest way to find
     out whether the gates are worth acting on.
+
+    `mode` tags which gate produced this trade ("reversal" or "continuation",
+    added 2026-08-29) so the two can be told apart later in paper_trades.json
+    without guessing from entry/stop shape.
     """
     entry, stop = setup["entry"], setup["stop"]
     risk_dist = abs(entry - stop)
     long = setup["direction"] == "long"
     return {
         "symbol": symbol,
+        "mode": mode,
         "direction": setup["direction"],
         "entry": entry,
         "stop": stop,
         "target": round(entry + 2 * risk_dist, 2) if long else round(entry - 2 * risk_dist, 2),
         "fee_pct": setup.get("fee_pct"),
+        "risk_pct_used": setup.get("risk_pct_used", RISK_PCT),
         "opened": now_utc.isoformat(),
         "status": "open",
     }
@@ -590,6 +609,95 @@ def evaluate_setup(r: dict, now_utc: datetime, news_blocked: bool = False):
             "entry": entry, "stop": stop, "fee_pct": fee_pct}
 
 
+def evaluate_trend_continuation_setup(trend_1d: str, event_4h: dict, candles_4h: list,
+                                       price: float, now_utc: datetime,
+                                       news_blocked: bool = False):
+    """Trend-continuation entry: trade a fresh 4H BOS immediately, without
+    waiting for the pullback evaluate_setup() requires.
+
+    Added 2026-08-29. The 2026-08-19->08-28 rally (BTC ~$65k->$81.5k, ETH
+    ~$1,900->$2,566) went almost entirely uncaptured by evaluate_setup —
+    every hourly check saw a confirmed bullish BOS but the demand-zone
+    pullback it waits for never came before price ran further. This is the
+    other half of the plan: evaluate_setup handles reversals (wait for the
+    pullback, tight stop near structure); this handles continuation (enter
+    on the break itself, wider stop at the breakout candle's own low/high).
+
+    Deliberately does NOT require price in a demand/supply zone, a separate
+    1H trigger, or a kill-zone window — the 4H BOS closing in the daily
+    trend's direction IS the trigger, and it happens on the 4H clock
+    (00/04/08/12/16/20 UTC), not London/NY hours. Requiring a kill zone here
+    would reintroduce the same "confirmed but stale by the time conditions
+    line up" gap this mode exists to fix. News blackout still applies —
+    that's about not entering into a stop-hunt candle, unrelated to entry
+    style.
+
+    Chamara's call (2026-08-29): the 2%-risk math must not gate the entry.
+    A structurally wide stop is fine — size to Binance's $100 minimum
+    notional instead of shrinking the stop or skipping the trade, and report
+    the resulting risk % plainly rather than silently forcing 2%.
+
+    `candles_4h` must be the SAME candle list/slice that produced `event_4h`
+    via structure.analyze(), since event_4h["index"] indexes into it.
+    """
+    gates = {}
+
+    is_bos = bool(event_4h and event_4h["type"] == "BOS")
+    direction = None
+    if is_bos and trend_1d == "up" and event_4h["direction"] == "bullish":
+        direction = "long"
+    elif is_bos and trend_1d == "down" and event_4h["direction"] == "bearish":
+        direction = "short"
+    gates["trend_aligned_bos"] = direction is not None
+
+    # Fresh means "this is the candle that just closed" — without this the
+    # same break re-fires every hour for days until the next event.
+    fresh = False
+    if direction:
+        try:
+            fresh = (now_utc - datetime.fromisoformat(event_4h["time"])) <= timedelta(hours=4)
+        except Exception:
+            fresh = False
+    gates["fresh"] = fresh
+    gates["news_clear"] = not news_blocked
+
+    if not all(gates.values()):
+        return {"ready": False, "gates": gates, "direction": direction}
+
+    breakout = candles_4h[event_4h["index"]]
+    entry = price
+    stop = breakout["low"] if direction == "long" else breakout["high"]
+
+    # Sanity: the breakout candle's own range must still put the stop on the
+    # correct side of entry. Can fail if price has already round-tripped
+    # past the breakout candle's opposite extreme by the time this runs.
+    valid_side = (stop < entry) if direction == "long" else (stop > entry)
+    gates["stop_valid"] = valid_side
+    if not valid_side:
+        return {"ready": False, "gates": gates, "direction": direction}
+
+    sl_distance_pct = abs(entry - stop) / entry * 100
+    min_risk_pct = round(risk.MIN_NOTIONAL_USD * sl_distance_pct / CAPITAL, 3)
+    risk_pct_used = max(RISK_PCT, min_risk_pct)
+
+    fee_pct = None
+    try:
+        m = risk.position_size(entry=entry, stop_loss=stop, capital=CAPITAL,
+                                risk_pct=risk_pct_used, leverage=LEVERAGE)
+        fee_pct = m["fees"]["pct_of_risk"]
+        gates["fee_ok"] = fee_pct <= MAX_FEE_PCT_OF_RISK
+    except Exception:
+        gates["fee_ok"] = False
+
+    return {
+        "ready": all(gates.values()), "gates": gates, "direction": direction,
+        "entry": entry, "stop": stop, "fee_pct": fee_pct,
+        "risk_pct_used": risk_pct_used,
+        "risk_unusually_high": risk_pct_used > 6.0,
+        "event": event_4h,
+    }
+
+
 def format_setup_alert(symbol: str, r: dict, setup: dict, now_utc: datetime) -> str:
     """The message Chamara actually wants: what triggered, the numbers, and
     the risk-management levels — not just 'a level moved'."""
@@ -632,6 +740,59 @@ def format_setup_alert(symbol: str, r: dict, setup: dict, now_utc: datetime) -> 
     )
 
 
+def format_continuation_alert(symbol: str, setup: dict, now_utc: datetime) -> str:
+    """The continuation-mode counterpart to format_setup_alert. No zone to
+    quote — the fresh trend-aligned 4H BOS itself is the trigger — and the
+    risk % actually used can be above the plan's default 2% when the
+    structurally-correct stop is wide enough to fall under Binance's $100
+    minimum at 2% (Chamara's call, 2026-08-29: size to the minimum instead
+    of shrinking the stop or skipping the trade)."""
+    entry, stop = setup["entry"], setup["stop"]
+    d = setup["direction"].upper()
+    risk_pct_used = setup.get("risk_pct_used", RISK_PCT)
+    try:
+        m = risk.position_size(entry=entry, stop_loss=stop, capital=CAPITAL,
+                                risk_pct=risk_pct_used, leverage=LEVERAGE)
+    except Exception as e:
+        return f"CONTINUATION SETUP {symbol} {d} @ {entry} / stop {stop} (math failed: {e})"
+
+    verdict = "PASS" if m["passes_plan"] else "FAIL"
+    warn = ""
+    if m.get("warnings"):
+        warn = "\nWarnings: " + "; ".join(str(w) for w in m["warnings"])
+    risk_note = (
+        f" (above the default {RISK_PCT}% — sized up to clear Binance's "
+        f"${risk.MIN_NOTIONAL_USD:.0f} minimum at this stop width)"
+        if risk_pct_used > RISK_PCT else ""
+    )
+
+    r_dist = abs(entry - stop)
+    breakeven = round(entry + r_dist, 2) if d == "LONG" else round(entry - r_dist, 2)
+    ev = setup.get("event") or {}
+
+    return (
+        f"CONTINUATION SETUP — {symbol} {d}\n"
+        f"Fresh {ev.get('type', 'BOS')} at {ev.get('level')} ({ev.get('time')}), "
+        f"same direction as the 1D trend — entering on the break, no pullback wait.\n\n"
+        f"Entry {entry}  |  Stop {stop} (breakout candle's own low/high)  |  "
+        f"Plan check: {verdict}\n"
+        f"Size {m['position']['size_btc']} (${m['position']['notional_usd']}), "
+        f"margin@{LEVERAGE}x ${m['position']['margin_by_leverage_usd'][f'{LEVERAGE}x']}\n"
+        f"Risk ${m['risk_amount_usd']} ({risk_pct_used}%){risk_note}, "
+        f"approx liq {m['approx_liquidation_price']}\n"
+        f"Targets 1:2={m['plan_target_prices']['1:2']}  "
+        f"1:3={m['plan_target_prices']['1:3']}\n"
+        f"Fees ~{m['fees']['pct_of_risk']}% of risk\n\n"
+        f"Manage: breakeven stop at {breakeven} (1R), then trail behind each "
+        f"new 4H swing. Decide now — single TP, scaled TPs, or trail with no "
+        f"fixed TP — don't wait until it's already in profit to decide.\n"
+        f"Backtested 6mo: BTC +0.79R/trade, ETH +0.45R/trade (see memory).\n"
+        f"{warn}\n"
+        f"Math only, NOT a recommendation. You decide.\n"
+        f"{footer(now_utc)}"
+    )
+
+
 async def check_symbol(symbol: str) -> dict:
     """Fetch + analyze one symbol via the same tested helpers the MCP server
     uses. Returns a plain result dict; does not touch persisted state."""
@@ -663,6 +824,8 @@ async def check_symbol(symbol: str) -> dict:
         "bar_low": candles_1h[-1]["low"] if candles_1h else None,
         "bar_high": candles_1h[-1]["high"] if candles_1h else None,
         "event_1h": latest_event(struct_1h),
+        "event_4h": latest_event(struct_4h),
+        "candles_4h": candles_4h,
         "supply": pick_supply_zone(struct_4h, price),
         "demand": pick_demand_zone(struct_4h, price),
         "bull_confirm": pick_bull_confirm(struct_4h),
@@ -811,6 +974,23 @@ async def main() -> None:
         else:
             sym_state.pop("last_headsup_key", None)
 
+        # Trend-continuation: the other half of the plan (added 2026-08-29).
+        # Independent of the reversal setup above — both can fire, neither
+        # blocks the other, since they trade different situations (a
+        # pullback vs. a break already running).
+        cont_setup = evaluate_trend_continuation_setup(
+            r["trend_1d"], r["event_4h"], r["candles_4h"], price, now,
+            news_blocked=news_blocked)
+        cont_gate_str = ",".join(k for k, v in cont_setup["gates"].items() if v) or "none"
+        if cont_setup["ready"]:
+            ev = cont_setup["event"]
+            cont_key = f"cont:{cont_setup['direction']}:{ev['time']}:{ev['level']}"
+            if cont_key != sym_state.get("last_cont_setup_key"):
+                telegram_msgs.append(format_continuation_alert(symbol, cont_setup, now))
+                paper.append(record_paper_trade(symbol, cont_setup, now, mode="continuation"))
+                sym_state["last_cont_setup_key"] = cont_key
+            alert_lines.append(f"[CONTINUATION READY] {symbol} {cont_setup['direction']}")
+
         demand_str = (f"{r['demand']['bottom']}-{r['demand']['top']}"
                       if r["demand"] else "none nearby")
         lines.append(
@@ -820,6 +1000,7 @@ async def main() -> None:
             f"bull>{r['bull_confirm']} | bear<{r['bear_confirm']}"
         )
         lines.append(f"  setup gates passed: {gate_str}")
+        lines.append(f"  continuation gates passed: {cont_gate_str}")
         summary.append(
             f"{symbol} ${price} — 1D {r['trend_1d']}/4H {r['trend_4h']}"
             f"/1H {r['trend_1h']}, zone {demand_str}"

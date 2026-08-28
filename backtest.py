@@ -92,10 +92,19 @@ def simulate(candles_1h, start_idx, direction, entry, stop, max_hours=240):
     return "open", 0.0, max_hours
 
 
-async def backtest(symbol: str, months: int, start_date=None, end_date=None):
+async def backtest(symbol: str, months: int, start_date=None, end_date=None,
+                    mode: str = "reversal"):
     """start_date/end_date make an out-of-sample run possible: the tuning was
     done on the most recent 18 months, so testing on an earlier window is the
-    only way to tell a real edge from a fitted one."""
+    only way to tell a real edge from a fitted one.
+
+    mode="reversal" replays evaluate_setup (pullback into a demand/supply
+    zone, tight stop). mode="continuation" replays
+    evaluate_trend_continuation_setup (enter on a fresh trend-aligned 4H BOS,
+    wider stop at the breakout candle's own low/high, sized to Binance's
+    minimum rather than a fixed 2%) — added 2026-08-29 to test whether it
+    would have caught the 2026-08-19->08-28 rally that evaluate_setup missed.
+    """
     if start_date and end_date:
         start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
         end = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
@@ -118,6 +127,7 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None):
     busy_until = -1
     cached_4h_idx = cached_1d_idx = -1
     st4h = st1d = None
+    c4h_slice = []  # the exact slice st4h was built from — event["index"] indexes into this
 
     for i, bar in enumerate(c1h):
         if t1h[i] < begin_ms or i < 200:
@@ -134,25 +144,31 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None):
         if i4 < 20 or i1 < 20:
             continue
         if i4 != cached_4h_idx:
-            st4h = structure.analyze(c4h[max(0, i4 - 199):i4 + 1], swing_strength=3)
+            c4h_slice = c4h[max(0, i4 - 199):i4 + 1]
+            st4h = structure.analyze(c4h_slice, swing_strength=3)
             cached_4h_idx = i4
         if i1 != cached_1d_idx:
             st1d = structure.analyze(c1d[max(0, i1 - 179):i1 + 1], swing_strength=2)
             cached_1d_idx = i1
-        st1h = structure.analyze(c1h[max(0, i - 199):i + 1], swing_strength=2)
 
         price = bar["close"]
-        r = {
-            "price": price,
-            "trend_1d": st1d.get("trend"),
-            "trend_4h": st4h.get("trend"),
-            "demand": mon.pick_demand_zone(st4h, price),
-            "supply": mon.pick_supply_zone(st4h, price),
-            "event_1h": mon.latest_event(st1h),
-            "bar_low": bar["low"],
-            "bar_high": bar["high"],
-        }
-        setup = mon.evaluate_setup(r, now)
+
+        if mode == "continuation":
+            setup = mon.evaluate_trend_continuation_setup(
+                st1d.get("trend"), mon.latest_event(st4h), c4h_slice, price, now)
+        else:
+            st1h = structure.analyze(c1h[max(0, i - 199):i + 1], swing_strength=2)
+            r = {
+                "price": price,
+                "trend_1d": st1d.get("trend"),
+                "trend_4h": st4h.get("trend"),
+                "demand": mon.pick_demand_zone(st4h, price),
+                "supply": mon.pick_supply_zone(st4h, price),
+                "event_1h": mon.latest_event(st1h),
+                "bar_low": bar["low"],
+                "bar_high": bar["high"],
+            }
+            setup = mon.evaluate_setup(r, now)
 
         for g, ok in setup["gates"].items():
             gate_hits[g] = gate_hits.get(g, 0) + (1 if ok else 0)
@@ -163,18 +179,25 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None):
             # Charge the round trip. Reporting gross R flatters every result;
             # on a $200 account with a 2% risk the fee is a real slice of it.
             fee_r = (setup.get("fee_pct") or 0.0) / 100.0
+            net_r = rr - fee_r if outcome != "open" else 0.0
+            risk_pct_used = setup.get("risk_pct_used", mon.RISK_PCT)
             trades.append({
                 "time": now.strftime("%Y-%m-%d %H:%M"),
                 "direction": setup["direction"], "entry": setup["entry"],
                 "stop": setup["stop"], "outcome": outcome,
-                "r": rr - fee_r if outcome != "open" else 0.0,
+                "r": net_r,
                 "gross_r": rr, "fee_r": fee_r, "hours": hours,
                 "session": mon.active_kill_zone(now),
-                "zone_kind": (setup["zone"] or {}).get("kind"),
+                "zone_kind": (setup.get("zone") or {}).get("kind") if mode != "continuation" else "continuation",
                 # Where in the 4H range the entry happened. Low = deep
                 # discount for a long; high = deep premium for a short.
                 "range_pct": (st4h.get("premium_discount") or {}).get("position_pct"),
                 "weekday": now.strftime("%a"),
+                "risk_pct_used": risk_pct_used,
+                # Actual $ at Chamara's $200 capital and the risk % this
+                # specific trade used — for continuation trades that can be
+                # above the default 2% (see evaluate_trend_continuation_setup).
+                "usd": net_r * mon.CAPITAL * risk_pct_used / 100,
             })
             busy_until = i + hours
 
@@ -232,9 +255,12 @@ def report(symbol, trades, gate_hits, bars):
           f"(~1 every {bars / len(trades):.0f} hours)")
     print(f"  wins {len(wins)} | losses {len(losses)} | unresolved {len(opens)}")
     if resolved:
+        total_usd = sum(t.get("usd", t["r"] * 4) for t in trades if t["outcome"] != "open")
+        avg_risk_pct = sum(t.get("risk_pct_used", 2.0) for t in trades) / len(trades)
         print(f"  win rate {100 * len(wins) / resolved:.1f}%")
         print(f"  total {total_r:+.1f}R, expectancy {total_r / resolved:+.2f}R/trade")
-        print(f"  on $200 at 2% risk: {total_r * 4:+.2f} USD")
+        print(f"  on $200, avg {avg_risk_pct:.2f}% risk/trade: {total_usd:+.2f} USD "
+              f"(uses each trade's actual risk %, not a flat 2%)")
     for t in trades:
         t["depth"] = depth_bucket(t)
     breakdown(trades, "direction", "direction")
@@ -254,13 +280,18 @@ async def main():
     ap.add_argument("--symbol", default=None)
     ap.add_argument("--start", default=None, help="YYYY-MM-DD, out-of-sample")
     ap.add_argument("--end", default=None, help="YYYY-MM-DD")
+    ap.add_argument("--mode", default="reversal", choices=["reversal", "continuation"],
+                     help="reversal = evaluate_setup (pullback into a zone); "
+                          "continuation = evaluate_trend_continuation_setup "
+                          "(enter on a fresh trend-aligned 4H BOS)")
     args = ap.parse_args()
 
     if args.start:
         print(f"OUT-OF-SAMPLE WINDOW {args.start} to {args.end}")
+    print(f"MODE: {args.mode}")
     symbols = [args.symbol.upper()] if args.symbol else mon.SYMBOLS
     for sym in symbols:
-        trades, gates, bars = await backtest(sym, args.months, args.start, args.end)
+        trades, gates, bars = await backtest(sym, args.months, args.start, args.end, args.mode)
         report(sym, trades, gates, bars)
 
 

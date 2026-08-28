@@ -6,6 +6,7 @@ identical to a quiet market.
 """
 from datetime import datetime, timedelta, timezone
 
+import risk
 import standalone_monitor as m
 
 
@@ -376,3 +377,147 @@ def test_paper_summary_reports_the_running_record():
 def test_paper_summary_before_anything_resolves():
     assert "no trades resolved yet" in m.paper_summary(
         [{"symbol": "BTCUSDT", "status": "open"}])
+
+
+# --- trend-continuation setup (added 2026-08-29) ----------------------------
+#
+# The reversal gate above requires price to pull back into a demand/supply
+# zone. Backtesting showed that requirement missed almost the entire
+# 2026-08-19->08-28 rally — every check saw a confirmed bullish BOS but no
+# qualifying pullback ever came. This gate trades the break itself instead:
+# a fresh BOS (not CHoCH — that stays a reversal signal) in the direction of
+# the 1D trend, stop at the breakout candle's own low/high, no zone or
+# kill-zone requirement.
+
+def _cont_candles(breakout_index=5, breakout_low=73500.0, breakout_high=74600.0):
+    """Six flat candles, then one wide breakout candle at `breakout_index`
+    whose [low, high] is what evaluate_trend_continuation_setup should pick
+    up as the stop for a long/short respectively."""
+    candles = [
+        {"open_time": f"c{i}", "open": 74000.0, "high": 74050.0, "low": 73950.0,
+         "close": 74000.0, "volume": 1.0}
+        for i in range(breakout_index)
+    ]
+    candles.append({
+        "open_time": "breakout", "open": 74000.0, "high": breakout_high,
+        "low": breakout_low, "close": 74400.0, "volume": 5.0,
+    })
+    return candles
+
+
+def _cont_event(direction="bullish", kind="BOS", level=74050.0, age_hours=1, index=5):
+    now = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)
+    ev_time = (now - timedelta(hours=age_hours)).isoformat()
+    return {"type": kind, "direction": direction, "level": level,
+            "time": ev_time, "index": index}, now
+
+
+def test_continuation_fires_long_on_fresh_aligned_bos():
+    event, now = _cont_event(direction="bullish")
+    candles = _cont_candles()
+    setup = m.evaluate_trend_continuation_setup("up", event, candles, 74400.0, now)
+    assert setup["ready"], setup["gates"]
+    assert setup["direction"] == "long"
+    assert setup["entry"] == 74400.0
+    assert setup["stop"] == candles[5]["low"]          # breakout candle's low
+
+
+def test_continuation_fires_short_on_fresh_aligned_bos():
+    # A wider high than the long test's default so the stop distance (~1.35%)
+    # keeps fees under MAX_FEE_PCT_OF_RISK — a tight stop failing on fee drag
+    # is a real, separate gate covered elsewhere, not what this test targets.
+    event, now = _cont_event(direction="bearish")
+    candles = _cont_candles(breakout_high=75000.0)
+    setup = m.evaluate_trend_continuation_setup("down", event, candles, 74000.0, now)
+    assert setup["ready"], setup["gates"]
+    assert setup["direction"] == "short"
+    assert setup["stop"] == candles[5]["high"]         # breakout candle's high
+
+
+def test_continuation_ignores_a_choch():
+    # A CHoCH is the reversal signal evaluate_setup already handles — this
+    # gate is only for continuation (BOS), so it must not double-fire.
+    event, now = _cont_event(direction="bullish", kind="CHoCH")
+    setup = m.evaluate_trend_continuation_setup("up", event, _cont_candles(), 74400.0, now)
+    assert not setup["ready"]
+    assert setup["gates"]["trend_aligned_bos"] is False
+
+
+def test_continuation_ignores_bos_against_the_daily_trend():
+    # A bullish BOS while daily is still down is a 4H-only counter-trend
+    # move, not continuation of anything — belongs to the stricter reversal
+    # rule (if it belongs anywhere), not this one.
+    event, now = _cont_event(direction="bullish")
+    setup = m.evaluate_trend_continuation_setup("down", event, _cont_candles(), 74400.0, now)
+    assert not setup["ready"]
+    assert setup["direction"] is None
+
+
+def test_continuation_rejects_a_stale_event():
+    event, now = _cont_event(direction="bullish", age_hours=9)
+    setup = m.evaluate_trend_continuation_setup("up", event, _cont_candles(), 74400.0, now)
+    assert not setup["ready"]
+    assert setup["gates"]["fresh"] is False
+
+
+def test_continuation_blocked_by_news():
+    event, now = _cont_event(direction="bullish")
+    setup = m.evaluate_trend_continuation_setup(
+        "up", event, _cont_candles(), 74400.0, now, news_blocked=True)
+    assert not setup["ready"]
+    assert setup["gates"]["news_clear"] is False
+
+
+def test_continuation_stays_at_default_risk_when_stop_is_tight():
+    # 73500 stop / 74400 entry is ~1.2% away — 2% risk already clears
+    # Binance's $100 minimum, so no bump is needed.
+    event, now = _cont_event(direction="bullish")
+    setup = m.evaluate_trend_continuation_setup("up", event, _cont_candles(), 74400.0, now)
+    assert setup["risk_pct_used"] == m.RISK_PCT
+
+
+def test_continuation_bumps_risk_pct_when_stop_is_wide():
+    # A much wider breakout candle (low far below entry, like the real
+    # 2026-08-19 BTC candle) pushes 2%-of-$200 below Binance's $100 minimum.
+    # Chamara's call (2026-08-29): size to the minimum instead of skipping —
+    # bump risk_pct rather than reject the trade.
+    event, now = _cont_event(direction="bullish")
+    candles = _cont_candles(breakout_low=70000.0)
+    setup = m.evaluate_trend_continuation_setup("up", event, candles, 74400.0, now)
+    assert setup["ready"], setup["gates"]
+    stop_dist_pct = (74400.0 - 70000.0) / 74400.0 * 100
+    expected = round(risk.MIN_NOTIONAL_USD * stop_dist_pct / m.CAPITAL, 3)
+    assert setup["risk_pct_used"] == expected
+    assert setup["risk_pct_used"] > m.RISK_PCT
+
+
+def test_continuation_rejects_when_breakout_candle_no_longer_validates_the_stop():
+    # If price has already traded back through the breakout candle's own low
+    # by the time this runs, "stop below that low" no longer makes sense.
+    event, now = _cont_event(direction="bullish")
+    candles = _cont_candles()
+    setup = m.evaluate_trend_continuation_setup("up", event, candles, 73000.0, now)
+    assert not setup["ready"]
+    assert setup["gates"]["stop_valid"] is False
+
+
+def test_continuation_alert_carries_the_numbers_that_matter():
+    event, now = _cont_event(direction="bullish")
+    setup = m.evaluate_trend_continuation_setup("up", event, _cont_candles(), 74400.0, now)
+    msg = m.format_continuation_alert("BTCUSDT", setup, now)
+    for expected in ("CONTINUATION SETUP", "BTCUSDT", "LONG", "Entry", "Stop",
+                      "Size", "Targets", "breakeven", "NOT a recommendation"):
+        assert expected in msg
+
+
+def test_paper_trade_tags_its_mode():
+    event, now = _cont_event(direction="bullish")
+    setup = m.evaluate_trend_continuation_setup("up", event, _cont_candles(), 74400.0, now)
+    t = m.record_paper_trade("BTCUSDT", setup, now, mode="continuation")
+    assert t["mode"] == "continuation"
+    assert t["risk_pct_used"] == setup["risk_pct_used"]
+
+
+def test_paper_trade_defaults_to_reversal_mode():
+    t = _paper()
+    assert t["mode"] == "reversal"
