@@ -31,6 +31,10 @@ Three methods mixed = three excuses to justify any trade. That is a FOMO trap. S
 - Elliott Wave may support a trade but can NEVER be the reason for one.
 - Master ONE method first. One method traded well beats three methods mixed.
 
+**Two entry styles (added 2026-08-29):** an SMC setup comes in two forms, and they are graded by two different checklists (Section 3A / 3B) — pick the one that matches what price is actually doing, never mix their rules.
+- **Reversal** — price pulls back into a demand/supply zone (Order Block or FVG) after a change of character (CHoCH). Tight stop just beyond the zone. This is the original method below.
+- **Continuation** — price is already trending and just broke a fresh high/low WITH that trend (a BOS, not a CHoCH). Enter on the break itself, no pullback wait — the wait is exactly what missed most of the 2026-08-19→08-28 rally. Wider stop, at the breakout candle's own low/high. Backtested (25 months out-of-sample): BTC +0.68R/trade, ETH +0.60R/trade — both real, both worth taking, not a lesser method.
+
 ---
 
 ## SECTION 1 — MINDSET & PHILOSOPHY
@@ -63,6 +67,8 @@ At 3x leverage: margin ≈ $400 / 3 ≈ $133
 
 **⚠️ Account-size warning:** On $200 this formula can still produce positions below Binance's minimum — **0.001 BTC _and_ $100 notional**, whichever is larger (an exchange rule — it does not scale with your capital) — OR force you to break your risk rule to meet it. If the math doesn't fit cleanly — **skip the trade.** Don't force size. (The `calculate_position_size` tool flags this automatically.)
 
+**Narrow exception — continuation trades only (2026-08-29):** a continuation entry's stop sits at the breakout candle's own low/high, which can be wide enough that 2% risk alone falls under Binance's $100 minimum. Rather than shrink that stop to an arbitrary, unstructural distance just to hit 2%, or skip a real setup over it, size to whatever risk % clears the $100 floor instead — reported plainly in the alert, not silently forced to 2%. This is still capped in spirit: if the math ever implies something well past ~5–6%, that is flagged as unusual, not auto-taken. This exception applies ONLY to continuation entries — reversal entries keep their tight, zone-based stop and the flat 2% cap, no exception needed.
+
 **Leverage by condition**
 - Strong trend + clean setup → max 5x
 - Ranging / unclear → max 3x
@@ -71,8 +77,8 @@ At 3x leverage: margin ≈ $400 / 3 ≈ $133
 
 ---
 
-## SECTION 3 — ENTRY RULES (FOMO FIX)
-**ALL 7 must be YES.** Even one NO = NO TRADE.
+## SECTION 3A — ENTRY RULES: REVERSAL (FOMO FIX)
+A pullback into a zone after a change of character (CHoCH). **ALL 7 must be YES.** Even one NO = NO TRADE.
 
 - [ ] HTF (Daily + 4H) trend confirmed — trade WITH the trend only
 - [ ] Minimum 3 confluences align (Elliott Wave + ICT level + SMC structure)
@@ -86,20 +92,40 @@ At 3x leverage: margin ≈ $400 / 3 ≈ $133
 
 ---
 
+## SECTION 3B — ENTRY RULES: CONTINUATION (added 2026-08-29)
+Price is already trending and just broke a fresh high/low WITH it. **ALL 6 must be YES.** No pullback wait — that wait is the whole point of this checklist existing.
+
+- [ ] Daily trend already clearly established (up or down)
+- [ ] A FRESH 4H BOS just confirmed, SAME direction as the Daily trend — a CHoCH is a reversal signal, use 3A instead, not this one
+- [ ] The breakout candle closed within the last ~4 hours — older than that is stale, skip it
+- [ ] Stop Loss = the breakout candle's own low (long) or high (short) — the structurally-correct level, not shrunk to fit 2% risk (see Section 2's exception)
+- [ ] No high-impact news within 30 min — check the calendar first
+- [ ] Fees still a reasonable share of the risk at this stop width — the sizing tool checks this automatically
+
+> No Kill Zone requirement here on purpose — a 4H candle closes on its own clock (00/04/08/12/16/20 UTC), and waiting for the next London/NY window just re-creates the "confirmed but already stale" gap this checklist exists to close.
+
+---
+
 ## SECTION 4 — STOP LOSS & TAKE PROFIT
 
 | DO — Always | NEVER — Zero Exceptions |
 |---|---|
 | Set SL before entry | Trade without a Stop Loss |
-| Place SL beyond the Order Block | Move SL against your position |
+| Reversal: SL beyond the Order Block. Continuation: SL beyond the breakout candle. | Move SL against your position |
 | Use min 1:2 RR | Hope price reverses back |
 | Move SL to breakeven at TP1 | Add to a losing position |
 | Accept small losses quickly | Skip SL because "the chart looks good" |
 
-**Take Profit**
+**Take Profit — Reversal (3A)**
 - TP1 (50%) at 1:2 → move SL to breakeven
 - TP2 (30%) at 1:3 → let it run
 - TP3 (20%) at 1:4+ → trail or target a major level
+
+**Take Profit — Continuation (3B), updated 2026-08-29**
+- Breakeven stop at 1R (same as always)
+- Half off at 1:2 → **the rest TRAILS behind each newly-confirmed 4H swing, no fixed final target**
+- This beat a straight fixed-1:2-and-done exit in a 25-month backtest — BTC +0.68R/trade vs +0.50R fixed, ETH +0.60R/trade vs +0.24R fixed (more than doubled). The old ETH long that closed at 2R when 6R+ was briefly available (2026-08-12) is exactly the mistake trailing fixes.
+- Default to trailing for continuation trades unless there's a specific reason not to — it is no longer just "an option," it is the backtested-better choice.
 
 > **Rule: never let a winning trade become a loser. SL to entry after TP1.**
 
@@ -110,7 +136,7 @@ Always go highest → lowest timeframe. Never trade against the Daily trend.
 
 1. **Weekly / Daily** — macro trend. Bullish = HH/HL. Bearish = LH/LL.
 2. **4H Structure** — Order Blocks, FVGs, BOS, CHoCH; premium vs discount.
-3. **1H Entry** — wait for 1H BOS/CHoCH; enter only at OB/FVG inside the 4H zone.
+3. **Entry** — two paths, see Section 3A/3B: **reversal** waits for a 1H BOS/CHoCH and enters only at an OB/FVG inside the 4H zone; **continuation** enters on a fresh 4H BOS itself, same direction as the Daily trend, no pullback wait.
 4. **Elliott Wave** — where are we? Wave 3 = best. Wave 5 = caution. ABC = counter-trend only.
 5. **Kill Zones** — London 07–09 UTC / NY 13–15 UTC.
 6. **Funding + Fear** — deeply negative funding = bullish pressure; Extreme Fear <20 = possible bottom.
@@ -130,6 +156,8 @@ Always go highest → lowest timeframe. Never trade against the Daily trend.
 | 15:00–17:00 | Afternoon | Close day trades, monitor swings |
 | 17:00–18:00 | Close | Complete journal, plan tomorrow |
 | 18:00+ | OFF | No charts. Rest is part of the job. |
+
+> This routine's trade windows are a Section 3A (reversal) rule — continuation setups (3B) have no Kill Zone requirement and can fire outside these hours. The "no charts after 18:00" rest rule still matters for your own sanity either way; the automated monitor watches continuation setups even while you're off.
 
 ---
 
@@ -168,7 +196,7 @@ Complete one for EVERY trade. No exceptions. Your journal is your most valuable 
 ## SECTION 10 — CHAMARA'S COMMITMENT
 I, Chamara, commit to:
 - ALWAYS set a Stop Loss before entering — no exceptions.
-- NEVER risk more than 2% on a single trade.
+- NEVER risk more than 2% on a single trade (Section 2's continuation-only exception is a deliberate, documented, capped carve-out — not a loophole).
 - NEVER use more than 5x leverage.
 - ALWAYS complete my journal after every trade.
 - STOP trading the moment my daily $10 loss limit is hit.
