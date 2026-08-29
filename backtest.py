@@ -21,6 +21,7 @@ Usage:
     python backtest.py                 # 6 months, both symbols
     python backtest.py --months 12
     python backtest.py --symbol BTCUSDT
+    python backtest.py --mode continuation --exit trailing
 """
 import argparse
 import asyncio
@@ -92,8 +93,84 @@ def simulate(candles_1h, start_idx, direction, entry, stop, max_hours=240):
     return "open", 0.0, max_hours
 
 
+def simulate_trailing(candles_4h, start_idx, direction, entry, stop,
+                       swing_strength=2, max_candles=120):
+    """4H-native alternative to simulate()'s fixed 1:2 exit, added 2026-08-29
+    to test whether trailing beats a hard cap for continuation trades — the
+    mode built specifically to catch big trends, which a fixed 1:2 works
+    against. Real precedent: the 2026-08-12 ETH long closed at 2R when 6R+
+    was briefly available, purely because only one fixed TP existed.
+
+    Policy (matches the plan's documented management rules in
+    manage_position(), just executed mechanically instead of alerted):
+      - stop to breakeven once price reaches 1R
+      - half the position locked at 1:2 (0.5R contribution, fixed)
+      - the remaining half trails behind the most recent CONFIRMED swing in
+        the trade's favor (new higher low for a long, lower high for a
+        short) — never moved backward — until it is stopped out or
+        max_candles runs out
+
+    Swing detection only ever looks at candles up to the current step (no
+    look-ahead). Returns (outcome, r_multiple, candles_held) — r_multiple is
+    already the blended total (locked half + trailed half, or the full
+    position if it never reached 1:2).
+    """
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return "open", 0.0, 0
+    long = direction == "long"
+    target_2r = entry + 2 * risk if long else entry - 2 * risk
+    current_stop = stop
+    breakeven_done = partial_done = False
+    partial_r = 0.0
+
+    def r_at(price):
+        return (price - entry) / risk if long else (entry - price) / risk
+
+    last_idx = min(start_idx + max_candles, len(candles_4h) - 1)
+    for offset in range(1, max_candles + 1):
+        i = start_idx + offset
+        if i >= len(candles_4h):
+            break
+        c = candles_4h[i]
+        hit_stop = c["low"] <= current_stop if long else c["high"] >= current_stop
+        hit_2r = c["high"] >= target_2r if long else c["low"] <= target_2r
+
+        # Pessimistic when one candle covers both, same convention as simulate().
+        if hit_stop:
+            total = partial_r + (0.5 if partial_done else 1.0) * r_at(current_stop)
+            return ("win" if total > 0 else "loss"), total, offset
+
+        if hit_2r and not partial_done:
+            partial_done = True
+            partial_r = 0.5 * 2.0
+            current_stop = entry
+            breakeven_done = True
+        elif not breakeven_done:
+            hit_1r = c["high"] >= entry + risk if long else c["low"] <= entry - risk
+            if hit_1r:
+                current_stop = entry
+                breakeven_done = True
+
+        # Trail behind the latest swing confirmed using only history up to
+        # here — find_swings needs `swing_strength` candles either side, so
+        # anything from the last few candles genuinely isn't confirmable yet.
+        seen = candles_4h[max(0, i - 199):i + 1]
+        swings = structure.find_swings(seen, swing_strength, swing_strength)
+        pivots = [s["price"] for s in swings if s["type"] == ("low" if long else "high")]
+        if pivots:
+            candidate = pivots[-1]
+            if (long and candidate > current_stop) or (not long and candidate < current_stop):
+                current_stop = candidate
+
+    # Ran out of data or hit max_candles — still open, valued at the last close.
+    last_close = candles_4h[last_idx]["close"]
+    total = partial_r + (0.5 if partial_done else 1.0) * r_at(last_close)
+    return "open", total, min(max_candles, last_idx - start_idx)
+
+
 async def backtest(symbol: str, months: int, start_date=None, end_date=None,
-                    mode: str = "reversal"):
+                    mode: str = "reversal", exit_style: str = "fixed"):
     """start_date/end_date make an out-of-sample run possible: the tuning was
     done on the most recent 18 months, so testing on an earlier window is the
     only way to tell a real edge from a fitted one.
@@ -174,8 +251,18 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
             gate_hits[g] = gate_hits.get(g, 0) + (1 if ok else 0)
 
         if setup["ready"]:
-            outcome, rr, hours = simulate(
-                c1h, i, setup["direction"], setup["entry"], setup["stop"])
+            if mode == "continuation" and exit_style == "trailing":
+                # event["index"] is relative to c4h_slice, not the full c4h
+                # list — map it back so simulate_trailing walks real candles.
+                ev = setup["event"]
+                full_breakout_idx = max(0, i4 - 199) + ev["index"]
+                outcome, rr, candles_held = simulate_trailing(
+                    c4h, full_breakout_idx, setup["direction"],
+                    setup["entry"], setup["stop"])
+                hours = candles_held * 4  # simulate_trailing walks 4H candles
+            else:
+                outcome, rr, hours = simulate(
+                    c1h, i, setup["direction"], setup["entry"], setup["stop"])
             # Charge the round trip. Reporting gross R flatters every result;
             # on a $200 account with a 2% risk the fee is a real slice of it.
             fee_r = (setup.get("fee_pct") or 0.0) / 100.0
@@ -284,14 +371,21 @@ async def main():
                      help="reversal = evaluate_setup (pullback into a zone); "
                           "continuation = evaluate_trend_continuation_setup "
                           "(enter on a fresh trend-aligned 4H BOS)")
+    ap.add_argument("--exit", dest="exit_style", default="fixed",
+                     choices=["fixed", "trailing"],
+                     help="fixed = walk to stop or a hard 1:2 (original). "
+                          "trailing = breakeven at 1R, half off at 1:2, rest "
+                          "trails behind new 4H swings (only affects "
+                          "--mode continuation; reversal always uses fixed).")
     args = ap.parse_args()
 
     if args.start:
         print(f"OUT-OF-SAMPLE WINDOW {args.start} to {args.end}")
-    print(f"MODE: {args.mode}")
+    print(f"MODE: {args.mode}  EXIT: {args.exit_style}")
     symbols = [args.symbol.upper()] if args.symbol else mon.SYMBOLS
     for sym in symbols:
-        trades, gates, bars = await backtest(sym, args.months, args.start, args.end, args.mode)
+        trades, gates, bars = await backtest(sym, args.months, args.start, args.end,
+                                              args.mode, args.exit_style)
         report(sym, trades, gates, bars)
 
 
