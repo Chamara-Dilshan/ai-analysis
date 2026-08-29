@@ -93,13 +93,16 @@ def simulate(candles_1h, start_idx, direction, entry, stop, max_hours=240):
     return "open", 0.0, max_hours
 
 
-def simulate_trailing(candles_4h, start_idx, direction, entry, stop,
+def simulate_trailing(candles, start_idx, direction, entry, stop,
                        swing_strength=2, max_candles=120):
-    """4H-native alternative to simulate()'s fixed 1:2 exit, added 2026-08-29
-    to test whether trailing beats a hard cap for continuation trades — the
-    mode built specifically to catch big trends, which a fixed 1:2 works
-    against. Real precedent: the 2026-08-12 ETH long closed at 2R when 6R+
-    was briefly available, purely because only one fixed TP existed.
+    """Timeframe-agnostic alternative to simulate()'s fixed 1:2 exit. Added
+    2026-08-29 for continuation trades, extended the same day to reversal
+    trades too — same policy, just fed a different candle list (4H +
+    max_candles=120 for continuation; 1H + max_candles=240 for reversal,
+    matching simulate()'s own 240-hour resolution window). A fixed 1:2 works
+    against the whole point of a trade meant to run: the 2026-08-12 ETH long
+    closed at 2R when 6R+ was briefly available, purely because only one
+    fixed TP existed.
 
     Policy (matches the plan's documented management rules in
     manage_position(), just executed mechanically instead of alerted):
@@ -113,7 +116,9 @@ def simulate_trailing(candles_4h, start_idx, direction, entry, stop,
     Swing detection only ever looks at candles up to the current step (no
     look-ahead). Returns (outcome, r_multiple, candles_held) — r_multiple is
     already the blended total (locked half + trailed half, or the full
-    position if it never reached 1:2).
+    position if it never reached 1:2). `candles_held` is in units of
+    whatever `candles` the caller passed (4H for continuation, 1H for
+    reversal) — convert to real hours at the call site if needed.
     """
     risk = abs(entry - stop)
     if risk <= 0:
@@ -127,12 +132,12 @@ def simulate_trailing(candles_4h, start_idx, direction, entry, stop,
     def r_at(price):
         return (price - entry) / risk if long else (entry - price) / risk
 
-    last_idx = min(start_idx + max_candles, len(candles_4h) - 1)
+    last_idx = min(start_idx + max_candles, len(candles) - 1)
     for offset in range(1, max_candles + 1):
         i = start_idx + offset
-        if i >= len(candles_4h):
+        if i >= len(candles):
             break
-        c = candles_4h[i]
+        c = candles[i]
         hit_stop = c["low"] <= current_stop if long else c["high"] >= current_stop
         hit_2r = c["high"] >= target_2r if long else c["low"] <= target_2r
 
@@ -155,7 +160,7 @@ def simulate_trailing(candles_4h, start_idx, direction, entry, stop,
         # Trail behind the latest swing confirmed using only history up to
         # here — find_swings needs `swing_strength` candles either side, so
         # anything from the last few candles genuinely isn't confirmable yet.
-        seen = candles_4h[max(0, i - 199):i + 1]
+        seen = candles[max(0, i - 199):i + 1]
         swings = structure.find_swings(seen, swing_strength, swing_strength)
         pivots = [s["price"] for s in swings if s["type"] == ("low" if long else "high")]
         if pivots:
@@ -164,7 +169,7 @@ def simulate_trailing(candles_4h, start_idx, direction, entry, stop,
                 current_stop = candidate
 
     # Ran out of data or hit max_candles — still open, valued at the last close.
-    last_close = candles_4h[last_idx]["close"]
+    last_close = candles[last_idx]["close"]
     total = partial_r + (0.5 if partial_done else 1.0) * r_at(last_close)
     return "open", total, min(max_candles, last_idx - start_idx)
 
@@ -181,6 +186,12 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
     wider stop at the breakout candle's own low/high, sized to Binance's
     minimum rather than a fixed 2%) — added 2026-08-29 to test whether it
     would have caught the 2026-08-19->08-28 rally that evaluate_setup missed.
+
+    exit_style="fixed" (default) walks to the stop or a hard 1:2, same as
+    always. exit_style="trailing" uses simulate_trailing() instead: breakeven
+    at 1R, half off at 1:2, the rest trailed behind new swings — applies to
+    both modes now (added for reversal 2026-08-29 after it clearly beat fixed
+    for continuation).
     """
     if start_date and end_date:
         start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
@@ -258,8 +269,14 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
                 full_breakout_idx = max(0, i4 - 199) + ev["index"]
                 outcome, rr, candles_held = simulate_trailing(
                     c4h, full_breakout_idx, setup["direction"],
-                    setup["entry"], setup["stop"])
-                hours = candles_held * 4  # simulate_trailing walks 4H candles
+                    setup["entry"], setup["stop"], swing_strength=2, max_candles=120)
+                hours = candles_held * 4  # simulate_trailing walked 4H candles here
+            elif mode == "reversal" and exit_style == "trailing":
+                # Reversal already operates directly on c1h at index i — no
+                # slice remapping needed, and 1 candle already equals 1 hour.
+                outcome, rr, hours = simulate_trailing(
+                    c1h, i, setup["direction"], setup["entry"], setup["stop"],
+                    swing_strength=2, max_candles=240)
             else:
                 outcome, rr, hours = simulate(
                     c1h, i, setup["direction"], setup["entry"], setup["stop"])
@@ -375,8 +392,8 @@ async def main():
                      choices=["fixed", "trailing"],
                      help="fixed = walk to stop or a hard 1:2 (original). "
                           "trailing = breakeven at 1R, half off at 1:2, rest "
-                          "trails behind new 4H swings (only affects "
-                          "--mode continuation; reversal always uses fixed).")
+                          "trails behind new swings — 4H swings for "
+                          "--mode continuation, 1H swings for --mode reversal.")
     args = ap.parse_args()
 
     if args.start:
