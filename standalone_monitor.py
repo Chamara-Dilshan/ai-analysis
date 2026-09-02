@@ -56,7 +56,21 @@ PAPER_PATH = HERE / "paper_trades.json"
 LOG_PATH = HERE / "monitor_log.txt"
 ALERT_PATH = HERE / "latest_alert.txt"
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+# Per-gate symbol lists, from the out-of-sample backtest (2023-01 -> 2025-02,
+# backtest.py). The continuation gate was positive on all five symbols in
+# both directions (10/10 cells). The reversal gate only earned its keep on
+# BTC, ETH and BNB — SOL -0.5R and XRP -4.5R — so it does not run there.
+# A gate with no edge on a symbol is not diversification, it is noise.
+REVERSAL_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+CONTINUATION_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+SYMBOLS = list(dict.fromkeys(REVERSAL_SYMBOLS + CONTINUATION_SYMBOLS))
+
+# Crypto moves together. The day BTC breaks, the alt continuation gates fire
+# the same direction — five positions at 2% each is 10% of the account at
+# risk at once, double the plan's daily loss limit. Cap concurrent open
+# setups; anything beyond it is logged, not alerted, so the paper record
+# still shows what the cap cost or saved.
+MAX_OPEN_POSITIONS = 2
 SL_OFFSET = timedelta(hours=5, minutes=30)
 
 # The plan's trading windows, UTC. A setup outside these is prep, not a trade.
@@ -333,30 +347,83 @@ def record_paper_trade(symbol: str, setup: dict, now_utc: datetime,
         "risk_pct_used": setup.get("risk_pct_used", RISK_PCT),
         "opened": now_utc.isoformat(),
         "status": "open",
+        # Trailing state, used only when mode == "continuation". Out-of-sample
+        # the two gates want opposite exits: trailing reversal trades gave
+        # back -3.7R, trailing continuation trades added +38.9R (+52%). The
+        # stop starts where the setup put it and only moves in the trade's
+        # favour.
+        "current_stop": stop,
+        "partial_r": 0.0,
+        "breakeven_done": False,
+        "partial_done": False,
     }
 
 
 def update_paper_trade(t: dict, r: dict, now_utc: datetime) -> bool:
     """Resolve an open paper trade against the hour's range. Returns True if
-    it closed on this pass. Stop is checked first, so a bar covering both
-    stop and target counts as a loss — the pessimistic reading."""
+    it closed on this pass.
+
+    The exit depends on which gate opened the trade — the split the
+    out-of-sample backtest produced (2023-01 -> 2025-02):
+      reversal:      fixed 1:2. Trailing these gave back -3.7R; the bounce
+                     IS the trade.
+      continuation:  breakeven at 1R, half off at 1:2, trail the rest behind
+                     the latest confirmed 4H swing. Trailing added +38.9R.
+    The stop is checked first, so a bar covering both counts as a loss — the
+    pessimistic reading, identical to the backtest's convention.
+    """
     if t["status"] != "open":
         return False
     lo = r.get("bar_low") or r["price"]
     hi = r.get("bar_high") or r["price"]
     long = t["direction"] == "long"
+    fee = (t.get("fee_pct") or 0) / 100
 
-    hit_stop = lo <= t["stop"] if long else hi >= t["stop"]
-    hit_target = hi >= t["target"] if long else lo <= t["target"]
+    if t.get("mode", "reversal") != "continuation":
+        hit_stop = lo <= t["stop"] if long else hi >= t["stop"]
+        hit_target = hi >= t["target"] if long else lo <= t["target"]
+        if hit_stop:
+            t.update(status="loss", r=-1.0 - fee, closed=now_utc.isoformat())
+            return True
+        if hit_target:
+            t.update(status="win", r=2.0 - fee, closed=now_utc.isoformat())
+            return True
+        return False
 
+    # --- continuation: trail it ---
+    entry = t["entry"]
+    risk_dist = abs(entry - t["stop"])
+    if risk_dist <= 0:
+        return False
+    cur = t.get("current_stop", t["stop"])
+    partial_r = t.get("partial_r", 0.0)
+    partial_done = t.get("partial_done", False)
+
+    def r_at(price):
+        return (price - entry) / risk_dist if long else (entry - price) / risk_dist
+
+    hit_stop = lo <= cur if long else hi >= cur
     if hit_stop:
-        t.update(status="loss", r=-1.0 - (t.get("fee_pct") or 0) / 100,
-                 closed=now_utc.isoformat())
+        total = partial_r + (0.5 if partial_done else 1.0) * r_at(cur) - fee
+        t.update(status="win" if total > 0 else "loss", r=total,
+                 closed=now_utc.isoformat(), current_stop=cur)
         return True
-    if hit_target:
-        t.update(status="win", r=2.0 - (t.get("fee_pct") or 0) / 100,
-                 closed=now_utc.isoformat())
-        return True
+
+    hit_2r = hi >= t["target"] if long else lo <= t["target"]
+    if hit_2r and not partial_done:
+        t.update(partial_done=True, partial_r=1.0, breakeven_done=True)
+        cur = entry
+    elif not t.get("breakeven_done"):
+        one_r = entry + risk_dist if long else entry - risk_dist
+        if (hi >= one_r) if long else (lo <= one_r):
+            t["breakeven_done"] = True
+            cur = entry
+
+    # Trail behind the latest confirmed 4H swing. Never backwards.
+    swing = r.get("recent_low_4h") if long else r.get("recent_high_4h")
+    if swing is not None and ((long and swing > cur) or (not long and swing < cur)):
+        cur = swing
+    t["current_stop"] = cur
     return False
 
 
@@ -374,6 +441,15 @@ def paper_summary(trades: list) -> str:
         f"(${total_r * CAPITAL * RISK_PCT / 100:+.2f} at your sizing). "
         f"{sum(1 for t in trades if t['status'] == 'open')} still open."
     )
+
+
+def open_slots(paper: list, positions: list) -> int:
+    """Distinct symbols currently occupying a slot: an open paper trade (every
+    fired setup) or a tracked real position. Distinct so a real trade that
+    is also on the paper record is not counted twice."""
+    syms = {t["symbol"] for t in paper if t.get("status") == "open"}
+    syms |= {p["symbol"] for p in positions if not p.get("closed")}
+    return len(syms)
 
 
 def load_positions() -> list:
@@ -412,15 +488,24 @@ def manage_position(pos: dict, r: dict, now_utc: datetime):
 
     # Stop breached. Reported, not second-guessed — the exchange has almost
     # certainly closed this already.
-    hit_stop = price <= stop if long else price >= stop
+    # Effective stop: the original until 1R, breakeven after it, and for a
+    # continuation trade the trailed 4H swing once one has been set.
+    eff_stop = pos.get("trail_stop") or (entry if pos.get("breakeven_done") else stop)
+    hit_stop = price <= eff_stop if long else price >= eff_stop
     if hit_stop and not pos.get("closed"):
         pos["closed"] = True
+        r_at_stop = ((eff_stop - entry) if long else (entry - eff_stop)) / risk_dist
+        if r_at_stop <= -0.999:
+            outcome = (f"Planned loss was ${round(CAPITAL * RISK_PCT / 100, 2)} "
+                       f"({RISK_PCT}% of capital). That is the system working, "
+                       f"not a failure.")
+        else:
+            outcome = (f"That stop sat at {r_at_stop:+.2f}R, so this closes flat "
+                       f"or in profit — the management rules did their job.")
         msgs.append(
             f"STOP HIT — {pos['symbol']} {pos['direction'].upper()}\n"
-            f"Price ${price} reached your stop {stop}.\n"
-            f"Planned loss was ${round(CAPITAL * RISK_PCT / 100, 2)} "
-            f"({RISK_PCT}% of capital). That is the system working, not a "
-            f"failure.\nRemoved from tracking.\n{footer(now_utc)}"
+            f"Price ${price} reached your stop {eff_stop}.\n"
+            f"{outcome}\nRemoved from tracking.\n{footer(now_utc)}"
         )
         return msgs
 
@@ -435,16 +520,47 @@ def manage_position(pos: dict, r: dict, now_utc: datetime):
             f"{footer(now_utc)}"
         )
 
-    # 1:2 — the plan's first target.
+    # 1:2 — the plan's first target. What happens here depends on the gate:
+    # a reversal trade is DONE (trailing them lost money out-of-sample); a
+    # continuation trade banks half and lets the rest run (trailing them
+    # added +52%).
+    mode = pos.get("mode", "reversal")
     if r_mult >= 2 and not pos.get("partial_done"):
         pos["partial_done"] = True
         target = round(entry + 2 * risk_dist, 2) if long else round(entry - 2 * risk_dist, 2)
+        if mode == "reversal":
+            pos["closed"] = True
+            msgs.append(
+                f"1:2 TARGET REACHED — {pos['symbol']} {pos['direction'].upper()}\n"
+                f"Price ${price} hit {target} ({round(r_mult, 2)}R).\n"
+                f"Reversal trade: take the FULL position off here. The bounce "
+                f"is the trade — trailing reversal setups gave back profit in "
+                f"testing.\nRemoved from tracking.\n{footer(now_utc)}"
+            )
+            return msgs
         msgs.append(
             f"1:2 TARGET REACHED — {pos['symbol']} {pos['direction'].upper()}\n"
             f"Price ${price} hit {target} ({round(r_mult, 2)}R).\n"
-            f"Plan: take half off here, trail the rest behind each new 1H swing.\n"
-            f"{footer(now_utc)}"
+            f"Continuation trade: take half off, stop to breakeven, and trail "
+            f"the rest behind each new 4H swing. This is the trade that pays "
+            f"for the others — let it run.\n{footer(now_utc)}"
         )
+
+    # Continuation only: past breakeven, trail behind the latest confirmed 4H
+    # swing and say so each time it moves. A swing that would loosen the stop
+    # is ignored — the stop only ever tightens.
+    if mode == "continuation" and pos.get("breakeven_done"):
+        candidate = r.get("recent_low_4h") if long else r.get("recent_high_4h")
+        current = pos.get("trail_stop") or entry
+        if candidate is not None and ((long and candidate > current) or
+                                      (not long and candidate < current)):
+            pos["trail_stop"] = candidate
+            msgs.append(
+                f"MOVE STOP — {pos['symbol']} {pos['direction'].upper()}\n"
+                f"New 4H swing {'low' if long else 'high'} confirmed at {candidate}. "
+                f"Move your stop there (was {current}). Currently {round(r_mult, 2)}R.\n"
+                f"{footer(now_utc)}"
+            )
 
     # Opposing 1H signal — the plan's exit-early rule. Announced once, and
     # re-armed if structure turns back in favour, so a chopping 1H does not
@@ -730,8 +846,8 @@ def format_setup_alert(symbol: str, r: dict, setup: dict, now_utc: datetime) -> 
         f"Targets 1:2={m['plan_target_prices']['1:2']}  "
         f"1:3={m['plan_target_prices']['1:3']}\n"
         f"Fees ~{m['fees']['pct_of_risk']}% of risk\n\n"
-        f"Manage: breakeven stop at {breakeven} (1R), then trail behind each "
-        f"new 1H swing. Half off at 1:2. Exit on an opposing 1H CHoCH rather "
+        f"Manage: breakeven stop at {breakeven} (1R), then take the FULL "
+        f"position off at 1:2 — trailing reversal trades lost money in testing. Exit on an opposing 1H CHoCH rather "
         f"than waiting for the stop.\n"
         f"1D {r['trend_1d']} / 4H {r['trend_4h']} — aligned.\n"
         f"{warn}\n"
@@ -938,8 +1054,13 @@ async def main() -> None:
                     telegram_msgs.append(msg)
                     alert_lines.append(f"[POSITION] {msg.splitlines()[0]}")
 
-        setup = evaluate_setup(r, now, news_blocked=news_blocked)
-        gate_str = ",".join(k for k, v in setup["gates"].items() if v) or "none"
+        if symbol in REVERSAL_SYMBOLS:
+            setup = evaluate_setup(r, now, news_blocked=news_blocked)
+            gate_str = ",".join(k for k, v in setup["gates"].items() if v) or "none"
+        else:
+            # No reversal edge on this symbol out-of-sample — do not run it.
+            setup = {"ready": False, "gates": {}, "direction": None, "zone": None}
+            gate_str = "n/a"
 
         if setup["ready"]:
             key = f"{setup['direction']}:{setup['zone']['bottom']}:{setup['zone']['top']}"
@@ -954,8 +1075,14 @@ async def main() -> None:
             # Re-sending the same setup every hour would train him to ignore
             # the alerts, which defeats the point.
             if key != last_key or stale:
-                telegram_msgs.append(format_setup_alert(symbol, r, setup, now))
-                paper.append(record_paper_trade(symbol, setup, now))
+                used = open_slots(paper, positions)
+                if used >= MAX_OPEN_POSITIONS:
+                    # Valid setup, full book. Logged, not sent.
+                    alert_lines.append(f"[SETUP CAPPED] {symbol} {setup['direction']} "
+                                       f"({used} open, cap {MAX_OPEN_POSITIONS})")
+                else:
+                    telegram_msgs.append(format_setup_alert(symbol, r, setup, now))
+                    paper.append(record_paper_trade(symbol, setup, now))
                 sym_state["last_setup_key"] = key
                 sym_state["last_setup_at"] = now.isoformat()
             alert_lines.append(f"[SETUP READY] {symbol} {setup['direction']}")
@@ -982,16 +1109,25 @@ async def main() -> None:
         # Independent of the reversal setup above — both can fire, neither
         # blocks the other, since they trade different situations (a
         # pullback vs. a break already running).
-        cont_setup = evaluate_trend_continuation_setup(
-            r["trend_1d"], r["event_4h"], r["candles_4h"], price, now,
-            news_blocked=news_blocked)
-        cont_gate_str = ",".join(k for k, v in cont_setup["gates"].items() if v) or "none"
+        if symbol in CONTINUATION_SYMBOLS:
+            cont_setup = evaluate_trend_continuation_setup(
+                r["trend_1d"], r["event_4h"], r["candles_4h"], price, now,
+                news_blocked=news_blocked)
+            cont_gate_str = ",".join(k for k, v in cont_setup["gates"].items() if v) or "none"
+        else:
+            cont_setup = {"ready": False, "gates": {}, "direction": None}
+            cont_gate_str = "n/a"
         if cont_setup["ready"]:
             ev = cont_setup["event"]
             cont_key = f"cont:{cont_setup['direction']}:{ev['time']}:{ev['level']}"
             if cont_key != sym_state.get("last_cont_setup_key"):
-                telegram_msgs.append(format_continuation_alert(symbol, cont_setup, now))
-                paper.append(record_paper_trade(symbol, cont_setup, now, mode="continuation"))
+                used = open_slots(paper, positions)
+                if used >= MAX_OPEN_POSITIONS:
+                    alert_lines.append(f"[CONTINUATION CAPPED] {symbol} {cont_setup['direction']} "
+                                       f"({used} open, cap {MAX_OPEN_POSITIONS})")
+                else:
+                    telegram_msgs.append(format_continuation_alert(symbol, cont_setup, now))
+                    paper.append(record_paper_trade(symbol, cont_setup, now, mode="continuation"))
                 sym_state["last_cont_setup_key"] = cont_key
             alert_lines.append(f"[CONTINUATION READY] {symbol} {cont_setup['direction']}")
 
@@ -1105,7 +1241,7 @@ def cli(argv) -> int:
         "usage:\n"
         "  standalone_monitor.py                        run the hourly check\n"
         "  standalone_monitor.py list                   show tracked trades\n"
-        "  standalone_monitor.py add SYM long|short ENTRY STOP\n"
+        "  standalone_monitor.py add SYM long|short ENTRY STOP [reversal|continuation]\n"
         "  standalone_monitor.py close SYM\n"
     )
     if not argv:
@@ -1124,8 +1260,14 @@ def cli(argv) -> int:
                   f"stop {p['stop']} {'[' + ','.join(flags) + ']' if flags else ''}")
         return 0
 
-    if cmd == "add" and len(rest) == 4:
+    if cmd == "add" and len(rest) in (4, 5):
         sym, direction, entry, stop = rest[0].upper(), rest[1].lower(), float(rest[2]), float(rest[3])
+        # Which gate produced it decides how it is managed: reversal closes in
+        # full at 1:2, continuation banks half and trails behind 4H swings.
+        mode = rest[4].lower() if len(rest) == 5 else "reversal"
+        if mode not in ("reversal", "continuation"):
+            print("mode must be reversal or continuation")
+            return 2
         if direction not in ("long", "short"):
             print("direction must be long or short")
             return 2
@@ -1136,10 +1278,13 @@ def cli(argv) -> int:
             return 2
         positions = [p for p in positions if p["symbol"] != sym]
         positions.append({"symbol": sym, "direction": direction, "entry": entry,
-                           "stop": stop, "opened": datetime.now(timezone.utc).isoformat()})
+                           "stop": stop, "mode": mode,
+                           "opened": datetime.now(timezone.utc).isoformat()})
         save_positions(positions)
         risk_dist = abs(entry - stop)
-        print(f"Tracking {sym} {direction} entry {entry} stop {stop}.")
+        print(f"Tracking {sym} {direction} entry {entry} stop {stop} as a {mode} trade.")
+        print("Exit rule: " + ("full close at 1:2." if mode == "reversal"
+                               else "half at 1:2, trail the rest behind 4H swings."))
         print(f"Breakeven alert at {round(entry + risk_dist, 2) if direction == 'long' else round(entry - risk_dist, 2)} (1R), "
               f"1:2 at {round(entry + 2 * risk_dist, 2) if direction == 'long' else round(entry - 2 * risk_dist, 2)}.")
         return 0
