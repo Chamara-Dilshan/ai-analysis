@@ -67,6 +67,57 @@ async def fetch_history(symbol: str, interval: str, start_ms: int, end_ms: int):
     return candles, times_ms
 
 
+async def fetch_funding_history(symbol: str, start_ms: int, end_ms: int):
+    """Funding settles every 8h; Binance keeps the full history (unlike open
+    interest and taker flow, which stop at ~30 days). Returns parallel lists
+    (times_ms, rate_pct) sorted by time, rate as a percent per 8h."""
+    times, rates, cursor = [], [], start_ms
+    while cursor < end_ms:
+        raw = await server._get(
+            server.BINANCE_BASE_URL, "/fapi/v1/fundingRate",
+            {"symbol": symbol, "startTime": cursor, "endTime": end_ms, "limit": 1000},
+            cache_ttl=0,
+        )
+        if not raw:
+            break
+        for row in raw:
+            times.append(int(row["fundingTime"]))
+            rates.append(float(row["fundingRate"]) * 100.0)
+        cursor = int(raw[-1]["fundingTime"]) + 1
+        if len(raw) < 1000:
+            break
+    return times, rates
+
+
+def funding_at(times, rates, t_ms):
+    """Most recent settled funding rate at or before t_ms, or None."""
+    i = bisect.bisect_right(times, t_ms) - 1
+    return rates[i] if i >= 0 else None
+
+
+def signed_funding(trade):
+    """Funding from the trade's point of view: positive means the crowd is
+    already on the same side (longs paying when we are long, shorts paying
+    when we are short) — i.e. we are joining a crowded position."""
+    f = trade.get("funding")
+    if f is None:
+        return None
+    return f if trade["direction"] == "long" else -f
+
+
+def funding_bucket(trade):
+    v = signed_funding(trade)
+    if v is None:
+        return "unknown"
+    if v < -0.005:
+        return "crowd-against"
+    if v <= 0.0105:
+        return "neutral"        # the 0.01% default lives here
+    if v <= 0.03:
+        return "crowded"
+    return "very-crowded"
+
+
 def simulate(candles_1h, start_idx, direction, entry, stop, max_hours=240):
     """Walk forward from the bar after entry to the first of stop or 1:2.
 
@@ -175,7 +226,8 @@ def simulate_trailing(candles, start_idx, direction, entry, stop,
 
 
 async def backtest(symbol: str, months: int, start_date=None, end_date=None,
-                    mode: str = "reversal", exit_style: str = "fixed"):
+                    mode: str = "reversal", exit_style: str = "fixed",
+                   funding_filter: float = 0.0):
     """start_date/end_date make an out-of-sample run possible: the tuning was
     done on the most recent 18 months, so testing on an earlier window is the
     only way to tell a real edge from a fitted one.
@@ -207,6 +259,8 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
     c1h, t1h = await fetch_history(symbol, "1h", s_ms, e_ms)
     c4h, t4h = await fetch_history(symbol, "4h", s_ms, e_ms)
     c1d, t1d = await fetch_history(symbol, "1d", s_ms, e_ms)
+    f_times, f_rates = await fetch_funding_history(symbol, s_ms, e_ms)
+    funding_filtered = 0
     print(f"{symbol}: {len(c1h)} 1H, {len(c4h)} 4H, {len(c1d)} 1D candles")
 
     begin_ms = int(start.timestamp() * 1000)
@@ -262,6 +316,13 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
             gate_hits[g] = gate_hits.get(g, 0) + (1 if ok else 0)
 
         if setup["ready"]:
+            funding_at_entry = funding_at(f_times, f_rates, t1h[i])
+            if funding_filter and funding_at_entry is not None:
+                crowd = funding_at_entry if setup["direction"] == "long" else -funding_at_entry
+                if crowd >= funding_filter:
+                    # Pre-registered rule: do not join a crowded side.
+                    funding_filtered += 1
+                    continue
             if mode == "continuation" and exit_style == "trailing":
                 # event["index"] is relative to c4h_slice, not the full c4h
                 # list — map it back so simulate_trailing walks real candles.
@@ -297,6 +358,7 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
                 # discount for a long; high = deep premium for a short.
                 "range_pct": (st4h.get("premium_discount") or {}).get("position_pct"),
                 "weekday": now.strftime("%a"),
+                "funding": funding_at_entry,
                 "risk_pct_used": risk_pct_used,
                 # Actual $ at Chamara's $200 capital and the risk % this
                 # specific trade used — for continuation trades that can be
@@ -305,6 +367,7 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
             })
             busy_until = i + hours
 
+    gate_hits["_funding_filtered"] = funding_filtered
     return trades, gate_hits, sum(1 for t in t1h if t >= begin_ms)
 
 
@@ -341,6 +404,9 @@ def depth_bucket(t):
 
 def report(symbol, trades, gate_hits, bars):
     print(f"\n{'=' * 58}\n{symbol} — {bars} hourly evaluations\n{'=' * 58}")
+    filtered = gate_hits.pop("_funding_filtered", 0)
+    if filtered:
+        print(f"Funding filter removed {filtered} setups before entry.")
     print("Gate pass rate (share of hours each gate was satisfied):")
     for g, n in sorted(gate_hits.items(), key=lambda kv: -kv[1]):
         print(f"  {g:12s} {n:6d}  {100 * n / max(bars, 1):5.1f}%")
@@ -367,10 +433,12 @@ def report(symbol, trades, gate_hits, bars):
               f"(uses each trade's actual risk %, not a flat 2%)")
     for t in trades:
         t["depth"] = depth_bucket(t)
+        t["funding_bucket"] = funding_bucket(t)
     breakdown(trades, "direction", "direction")
     breakdown(trades, "session", "session")
     breakdown(trades, "zone_kind", "zone type")
     breakdown(trades, "depth", "entry depth in 4H range")
+    breakdown(trades, "funding_bucket", "funding at entry (crowd on my side?)")
 
     print("\n  date              dir    entry      stop    result   hrs")
     for t in trades[-5:]:
@@ -388,6 +456,9 @@ async def main():
                      help="reversal = evaluate_setup (pullback into a zone); "
                           "continuation = evaluate_trend_continuation_setup "
                           "(enter on a fresh trend-aligned 4H BOS)")
+    ap.add_argument("--funding-filter", dest="funding_filter", type=float, default=0.0,
+                    help="Skip setups where funding (%% per 8h) is >= this on the "
+                         "trade's own side, e.g. 0.03. 0 disables.")
     ap.add_argument("--exit", dest="exit_style", default="fixed",
                      choices=["fixed", "trailing"],
                      help="fixed = walk to stop or a hard 1:2 (original). "
@@ -402,7 +473,7 @@ async def main():
     symbols = [args.symbol.upper()] if args.symbol else mon.SYMBOLS
     for sym in symbols:
         trades, gates, bars = await backtest(sym, args.months, args.start, args.end,
-                                              args.mode, args.exit_style)
+                                              args.mode, args.exit_style, args.funding_filter)
         report(sym, trades, gates, bars)
 
 
