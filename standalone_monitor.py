@@ -490,7 +490,10 @@ def manage_position(pos: dict, r: dict, now_utc: datetime):
     # certainly closed this already.
     # Effective stop: the original until 1R, breakeven after it, and for a
     # continuation trade the trailed 4H swing once one has been set.
-    eff_stop = pos.get("trail_stop") or (entry if pos.get("breakeven_done") else stop)
+    # Breakeven always wins over a trailed level that sits below it.
+    base = entry if pos.get("breakeven_done") else stop
+    ts = pos.get("trail_stop")
+    eff_stop = base if ts is None else (max(ts, base) if long else min(ts, base))
     hit_stop = price <= eff_stop if long else price >= eff_stop
     if hit_stop and not pos.get("closed"):
         pos["closed"] = True
@@ -549,9 +552,15 @@ def manage_position(pos: dict, r: dict, now_utc: datetime):
     # Continuation only: past breakeven, trail behind the latest confirmed 4H
     # swing and say so each time it moves. A swing that would loosen the stop
     # is ignored — the stop only ever tightens.
-    if mode == "continuation" and pos.get("breakeven_done"):
+    # Trails from ENTRY, not only after breakeven - that is what the
+    # backtest (+38.9R) and the paper journal both do. Waiting for 1R
+    # left a live position on its original stop while a confirmed 4H
+    # swing had already formed above it.
+    if mode == "continuation":
         candidate = r.get("recent_low_4h") if long else r.get("recent_high_4h")
-        current = pos.get("trail_stop") or entry
+        base = entry if pos.get("breakeven_done") else stop
+        current = pos.get("trail_stop") or base
+        current = max(current, base) if long else min(current, base)
         if candidate is not None and ((long and candidate > current) or
                                       (not long and candidate < current)):
             pos["trail_stop"] = candidate

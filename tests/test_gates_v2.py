@@ -122,3 +122,25 @@ def test_open_slots_counts_distinct_symbols_across_paper_and_tracked():
     positions = [{"symbol": "BTCUSDT"}, {"symbol": "XRPUSDT", "closed": True}]
     assert m.open_slots(paper, positions) == 2
     assert m.MAX_OPEN_POSITIONS == 2
+
+
+# --- trailing starts at entry, matching the backtest (found live 2026-09-05) --
+
+def test_manage_continuation_trails_before_breakeven():
+    # Original stop 90, entry 100. A confirmed 4H swing low at 94 is above
+    # the stop but below entry: the stop should tighten to it now, not wait
+    # for 1R. The backtest that produced the +38.9R did exactly this.
+    pos = {"symbol": "BTCUSDT", "direction": "long", "entry": 100.0, "stop": 90.0,
+           "mode": "continuation"}
+    msgs = m.manage_position(pos, {"price": 98.0, "event_1h": None, "recent_low_4h": 94.0}, NOW)
+    assert pos["trail_stop"] == 94.0
+    assert any("MOVE STOP" in x for x in msgs)
+
+
+def test_manage_breakeven_beats_a_lower_trailed_stop():
+    # Trailed to 94 before 1R, then breakeven reached: the effective stop
+    # must be entry (100), never the lower 94.
+    pos = {"symbol": "BTCUSDT", "direction": "long", "entry": 100.0, "stop": 90.0,
+           "mode": "continuation", "breakeven_done": True, "trail_stop": 94.0}
+    msgs = m.manage_position(pos, {"price": 99.0, "event_1h": None}, NOW)
+    assert pos["closed"] and any("STOP HIT" in x and "100.0" in x for x in msgs)
