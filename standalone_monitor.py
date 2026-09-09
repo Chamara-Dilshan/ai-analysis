@@ -427,6 +427,26 @@ def update_paper_trade(t: dict, r: dict, now_utc: datetime) -> bool:
     return False
 
 
+def read_for_trade(r: dict, trade: dict, since_utc):
+    """Copy of the symbol read whose bar range starts no earlier than the
+    trade itself was opened. Bars that traded before the entry cannot stop
+    a trade that did not exist yet."""
+    opened = trade.get("opened")
+    start = since_utc
+    if opened:
+        try:
+            o = datetime.fromisoformat(opened)
+            if o.tzinfo is None:
+                o = o.replace(tzinfo=timezone.utc)
+            start = o if start is None else max(start, o)
+        except Exception:
+            pass
+    if start is None or start == since_utc or not r.get("candles_1h"):
+        return r
+    lo, hi = range_since(r["candles_1h"], start)
+    return dict(r, bar_low=lo, bar_high=hi)
+
+
 def paper_summary(trades: list) -> str:
     """Plain-language scoreboard of the forward record so far."""
     done = [t for t in trades if t["status"] in ("win", "loss")]
@@ -477,6 +497,10 @@ def manage_position(pos: dict, r: dict, now_utc: datetime):
     """
     msgs = []
     price = r["price"]
+    # The bar range since the last run. Wicks hit stops; closes do not
+    # un-hit them. Falls back to the close when no range is supplied.
+    lo = r.get("bar_low") or price
+    hi = r.get("bar_high") or price
     entry, stop = pos["entry"], pos["stop"]
     long = pos["direction"] == "long"
     risk_dist = abs(entry - stop)
@@ -484,7 +508,10 @@ def manage_position(pos: dict, r: dict, now_utc: datetime):
         return msgs
 
     profit = (price - entry) if long else (entry - price)
-    r_mult = profit / risk_dist
+    r_mult = profit / risk_dist                      # where it is now
+    best = (hi - entry) if long else (entry - lo)
+    best_r = best / risk_dist                        # the best it got to
+    adverse = lo if long else hi                     # the worst it got to
 
     # Stop breached. Reported, not second-guessed — the exchange has almost
     # certainly closed this already.
@@ -494,7 +521,9 @@ def manage_position(pos: dict, r: dict, now_utc: datetime):
     base = entry if pos.get("breakeven_done") else stop
     ts = pos.get("trail_stop")
     eff_stop = base if ts is None else (max(ts, base) if long else min(ts, base))
-    hit_stop = price <= eff_stop if long else price >= eff_stop
+    # Checked FIRST against the adverse extreme: a bar that covers both the
+    # stop and a milestone counts as stopped, the backtest's convention.
+    hit_stop = adverse <= eff_stop if long else adverse >= eff_stop
     if hit_stop and not pos.get("closed"):
         pos["closed"] = True
         r_at_stop = ((eff_stop - entry) if long else (entry - eff_stop)) / risk_dist
@@ -507,18 +536,19 @@ def manage_position(pos: dict, r: dict, now_utc: datetime):
                        f"or in profit — the management rules did their job.")
         msgs.append(
             f"STOP HIT — {pos['symbol']} {pos['direction'].upper()}\n"
-            f"Price ${price} reached your stop {eff_stop}.\n"
+            f"The bar traded to {adverse}, through your stop {eff_stop} "
+            f"(now ${price}).\n"
             f"{outcome}\nRemoved from tracking.\n{footer(now_utc)}"
         )
         return msgs
 
     # 1R — the stop should come to breakeven so the trade cannot turn into a
     # loser from here.
-    if r_mult >= 1 and not pos.get("breakeven_done"):
+    if best_r >= 1 and not pos.get("breakeven_done"):
         pos["breakeven_done"] = True
         msgs.append(
             f"MOVE STOP TO BREAKEVEN — {pos['symbol']} {pos['direction'].upper()}\n"
-            f"Price ${price} is 1R from entry {entry}.\n"
+            f"Price reached 1R from entry {entry} (now ${price}, {round(r_mult, 2)}R).\n"
             f"Move your stop to {entry}. From here the trade cannot lose.\n"
             f"{footer(now_utc)}"
         )
@@ -528,14 +558,14 @@ def manage_position(pos: dict, r: dict, now_utc: datetime):
     # continuation trade banks half and lets the rest run (trailing them
     # added +52%).
     mode = pos.get("mode", "reversal")
-    if r_mult >= 2 and not pos.get("partial_done"):
+    if best_r >= 2 and not pos.get("partial_done"):
         pos["partial_done"] = True
         target = round(entry + 2 * risk_dist, 2) if long else round(entry - 2 * risk_dist, 2)
         if mode == "reversal":
             pos["closed"] = True
             msgs.append(
                 f"1:2 TARGET REACHED — {pos['symbol']} {pos['direction'].upper()}\n"
-                f"Price ${price} hit {target} ({round(r_mult, 2)}R).\n"
+                f"Price hit {target} this bar (now ${price}, {round(r_mult, 2)}R).\n"
                 f"Reversal trade: take the FULL position off here. The bounce "
                 f"is the trade — trailing reversal setups gave back profit in "
                 f"testing.\nRemoved from tracking.\n{footer(now_utc)}"
@@ -543,7 +573,7 @@ def manage_position(pos: dict, r: dict, now_utc: datetime):
             return msgs
         msgs.append(
             f"1:2 TARGET REACHED — {pos['symbol']} {pos['direction'].upper()}\n"
-            f"Price ${price} hit {target} ({round(r_mult, 2)}R).\n"
+            f"Price hit {target} this bar (now ${price}, {round(r_mult, 2)}R).\n"
             f"Continuation trade: take half off, stop to breakeven, and trail "
             f"the rest behind each new 4H swing. This is the trade that pays "
             f"for the others — let it run.\n{footer(now_utc)}"
@@ -922,9 +952,36 @@ def format_continuation_alert(symbol: str, setup: dict, now_utc: datetime) -> st
     )
 
 
-async def check_symbol(symbol: str) -> dict:
+def range_since(candles: list, since_utc, bar_hours: int = 1):
+    """(low, high) across every candle still forming at or after `since_utc`,
+    plus the current forming bar. With no reference point only the forming
+    bar counts. Runs are hourly at :07, so between two runs one bar
+    completes; its wicks are what the close-only check kept missing."""
+    if not candles:
+        return None, None
+    chosen = candles[-1:]
+    if since_utc is not None:
+        picked = []
+        for c in candles:
+            try:
+                open_t = datetime.fromisoformat(c["open_time"])
+            except Exception:
+                continue
+            if open_t.tzinfo is None:
+                open_t = open_t.replace(tzinfo=timezone.utc)
+            if open_t + timedelta(hours=bar_hours) > since_utc:
+                picked.append(c)
+        if picked:
+            chosen = picked
+    return min(c["low"] for c in chosen), max(c["high"] for c in chosen)
+
+
+async def check_symbol(symbol: str, since_utc=None) -> dict:
     """Fetch + analyze one symbol via the same tested helpers the MCP server
-    uses. Returns a plain result dict; does not touch persisted state."""
+    uses. Returns a plain result dict; does not touch persisted state.
+    `since_utc` is the previous run's time: bar_low/bar_high then span every
+    bar that traded since it, so an intra-hour stop or target hit between
+    runs is seen."""
     price_data = await server._get(
         server.BINANCE_BASE_URL, "/fapi/v1/ticker/24hr", {"symbol": symbol},
     )
@@ -950,8 +1007,9 @@ async def check_symbol(symbol: str) -> dict:
         "trend_1d": struct_1d.get("trend"),
         "trend_4h": struct_4h.get("trend"),
         "trend_1h": struct_1h.get("trend"),
-        "bar_low": candles_1h[-1]["low"] if candles_1h else None,
-        "bar_high": candles_1h[-1]["high"] if candles_1h else None,
+        "bar_low": range_since(candles_1h, since_utc)[0],
+        "bar_high": range_since(candles_1h, since_utc)[1],
+        "candles_1h": candles_1h,
         "event_1h": latest_event(struct_1h),
         "event_4h": latest_event(struct_4h),
         "candles_4h": candles_4h,
@@ -1002,10 +1060,17 @@ async def main() -> None:
     news_blocked, news_note = await check_news_blackout(now)
     lines.append(f"  {news_note}")
 
+    last_run = None
+    if state.get("last_run"):
+        try:
+            last_run = datetime.fromisoformat(state["last_run"])
+        except Exception:
+            last_run = None
+
     for symbol in SYMBOLS:
         sym_state = state.get(symbol, {})
         try:
-            r = await check_symbol(symbol)
+            r = await check_symbol(symbol, since_utc=last_run)
         except Exception as e:
             lines.append(f"{symbol}: ERROR fetching/analyzing - {e}")
             state[symbol] = sym_state
@@ -1050,7 +1115,8 @@ async def main() -> None:
         # run, alerted only when every gate passes.
         # Resolve any open paper trades for this symbol against the hour.
         for t in paper:
-            if t["symbol"] == symbol and update_paper_trade(t, r, now):
+            if t["symbol"] == symbol and update_paper_trade(
+                    t, read_for_trade(r, t, last_run), now):
                 alert_lines.append(
                     f"[PAPER] {symbol} {t['direction']} -> {t['status']} "
                     f"({t.get('r', 0):+.2f}R)")
@@ -1059,7 +1125,7 @@ async def main() -> None:
         # already hold is where the plan's rules actually get broken.
         for pos in positions:
             if pos["symbol"] == symbol and not pos.get("closed"):
-                for msg in manage_position(pos, r, now):
+                for msg in manage_position(pos, read_for_trade(r, pos, last_run), now):
                     telegram_msgs.append(msg)
                     alert_lines.append(f"[POSITION] {msg.splitlines()[0]}")
 
@@ -1219,6 +1285,7 @@ async def main() -> None:
     # so a milestone is announced once, not every hour.
     save_positions([p for p in positions if not p.get("closed")])
     save_paper(paper)
+    state["last_run"] = now.isoformat()
 
     lines.append(footer(now))
     log("\n".join(lines))
