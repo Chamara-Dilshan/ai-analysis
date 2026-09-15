@@ -33,7 +33,16 @@ Three methods mixed = three excuses to justify any trade. That is a FOMO trap. S
 
 **Two entry styles (added 2026-08-29):** an SMC setup comes in two forms, and they are graded by two different checklists (Section 3A / 3B) — pick the one that matches what price is actually doing, never mix their rules.
 - **Reversal** — price pulls back into a demand/supply zone (Order Block or FVG) after a change of character (CHoCH). Tight stop just beyond the zone. This is the original method below.
-- **Continuation** — price is already trending and just broke a fresh high/low WITH that trend (a BOS, not a CHoCH). Enter on the break itself, no pullback wait — the wait is exactly what missed most of the 2026-08-19→08-28 rally. Wider stop, at the breakout candle's own low/high. Backtested (25 months out-of-sample): BTC +0.68R/trade, ETH +0.60R/trade — both real, both worth taking, not a lesser method.
+- **Continuation** — price is already trending and just broke a fresh high/low WITH that trend (a BOS, not a CHoCH). Enter on the break itself, no pullback wait — the wait is exactly what missed most of the 2026-08-19→08-28 rally. Wider stop, at the breakout candle's own low/high.
+
+**Which style is working depends on the market's regime (corrected out-of-sample data, 2026-09-16).** Earlier versions of this plan quoted much larger continuation figures; those came from a look-ahead bug in the backtester, now fixed. The honest numbers:
+
+| net R, out-of-sample | trending 2021-23 | choppy 2023-25 |
+| --- | --- | --- |
+| Continuation (5 symbols) | **+115.4R** | +12.8R |
+| Reversal (BTC/ETH/BNB) | −10.6R | **+27.6R** |
+
+Neither style is better than the other — they are mirror images. In a sustained trend, breakouts keep running and pullback entries get run over. In chop, breakouts fail and price reverts to its zones. That is the whole reason to keep both: one of them is usually suited to what the market is doing. Be honest about which regime you are in before deciding how hard to push a setup.
 
 ---
 
@@ -124,8 +133,11 @@ Price is already trending and just broke a fresh high/low WITH it. **ALL 6 must 
 **Take Profit — Continuation (3B), updated 2026-08-29**
 - Breakeven stop at 1R (same as always)
 - Half off at 1:2 → **the rest TRAILS behind each newly-confirmed 4H swing, no fixed final target**
-- This beat a straight fixed-1:2-and-done exit in a 25-month backtest — BTC +0.68R/trade vs +0.50R fixed, ETH +0.60R/trade vs +0.24R fixed (more than doubled). The old ETH long that closed at 2R when 6R+ was briefly available (2026-08-12) is exactly the mistake trailing fixes.
-- Default to trailing for continuation trades unless there's a specific reason not to — it is no longer just "an option," it is the backtested-better choice.
+- Trailing beats a fixed-1:2-and-done exit overall on corrected out-of-sample data — **+128.2R vs +49.1R** across two windows — so it stays the default. The old ETH long that closed at 2R when 6R+ was briefly available (2026-08-12) is exactly the mistake trailing fixes.
+- **But it is not unconditional, and the earlier "+0.68R vs +0.50R" figures here were bug-inflated.** Trailing's advantage comes almost entirely from trending markets (+115.4R vs +27.9R). In the choppy window the fixed 1:2 actually won (+21.2R vs +12.8R) — trailing hands back in chop what it earns in trends.
+- So: default to trailing, but if price has been whipsawing rather than trending, closing the full position at 1:2 is a reasonable judgement call, not a mistake.
+
+**Take Profit — Reversal (3A): keep the full close at 1:2.** Re-tested on corrected data across three windows: fixed won two of them (+27.6R and +3.0R), trailing won one (+22.6R in the trending window). Note the old note claiming "trailing reversal trades lost money in testing" was **wrong** — trailing was positive in all three windows, just not better. The fixed 1:2 stands on the evidence, not on that claim.
 
 > **Rule: never let a winning trade become a loser. SL to entry after TP1.**
 

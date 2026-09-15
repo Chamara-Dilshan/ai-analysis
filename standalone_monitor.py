@@ -22,10 +22,19 @@ own (added 2026-08-29, see evaluate_setup / evaluate_trend_continuation_setup):
                    pullback wait, wider stop at the breakout candle's own
                    low/high. Added after backtesting showed the reversal-only
                    gate missed almost the entire 2026-08-19->08-28 rally.
-                   6-month backtest (`backtest.py --mode continuation`):
-                   +0.79R/trade BTC, +0.45R/trade ETH, both directions
-                   profitable — see crypto-analysis-output-format memory for
-                   the full numbers.
+
+The two gates are REGIME-COMPLEMENTARY, which is the real reason to run both.
+Out-of-sample, corrected harness (the pre-2026-09-15 figures were inflated by
+a look-ahead bug — see the fix in backtest.py):
+  - continuation, 5 symbols: +115.4R in trending 2021-23, +12.8R in choppy
+    2023-25. It earns in sustained trends and treads water in whipsaw.
+  - reversal, BTC/ETH/BNB: -10.6R in that same trending window, +27.6R in the
+    choppy one. Exactly the mirror.
+Neither gate is "better". In a trend, breakouts continue and pullback entries
+get run over; in chop, breakouts fail and price reverts to its zones. Running
+both means one of them is usually in its element. Recent real-world numbers
+are thin for both (2025-02->2026-09: reversal +3.0R), so treat any claim of a
+strong edge with suspicion. Full tables in crypto-analysis-output-format memory.
 
 State persists in monitor_state.json so a fresh hourly process only alerts on
 a NEW condition, not a still-standing one (mirrors the chat monitor's
@@ -56,10 +65,15 @@ PAPER_PATH = HERE / "paper_trades.json"
 LOG_PATH = HERE / "monitor_log.txt"
 ALERT_PATH = HERE / "latest_alert.txt"
 
-# Per-gate symbol lists, from the out-of-sample backtest (2023-01 -> 2025-02,
-# backtest.py). The continuation gate was positive on all five symbols in
-# both directions (10/10 cells). The reversal gate only earned its keep on
-# BTC, ETH and BNB — SOL -0.5R and XRP -4.5R — so it does not run there.
+# Per-gate symbol lists, from out-of-sample backtests (backtest.py). Numbers
+# below are from the corrected harness; the original split was decided on
+# look-ahead-inflated figures, and re-checking on corrected data across three
+# windows did not change either list.
+#   continuation — positive on all five in the trending 2021-23 window; ETH,
+#     SOL and XRP go negative in the choppy 2023-25 one. Regime, not symbol:
+#     the scope stays at five.
+#   reversal — negative on SOL and XRP in all THREE windows tested
+#     (2021-23, 2023-25, 2025-02->2026-09), so it does not run there.
 # A gate with no edge on a symbol is not diversification, it is noise.
 REVERSAL_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 CONTINUATION_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
@@ -934,7 +948,10 @@ def format_setup_alert(symbol: str, r: dict, setup: dict, now_utc: datetime) -> 
         f"1:3={m['plan_target_prices']['1:3']}\n"
         f"Fees ~{m['fees']['pct_of_risk']}% of risk\n\n"
         f"Manage: breakeven stop at {breakeven} (1R), then take the FULL "
-        f"position off at 1:2 — trailing reversal trades lost money in testing. Exit on an opposing 1H CHoCH rather "
+        f"position off at 1:2. Trailing was re-tested on corrected data over "
+        f"three windows and won only one of them (it is not a money-loser — "
+        f"that older claim was wrong — just not better here), so the fixed "
+        f"1:2 stands. Exit on an opposing 1H CHoCH rather "
         f"than waiting for the stop.\n"
         f"1D {r['trend_1d']} / 4H {r['trend_4h']} — aligned.\n"
         f"{warn}\n"
@@ -987,10 +1004,12 @@ def format_continuation_alert(symbol: str, setup: dict, now_utc: datetime) -> st
         f"1:3={m['plan_target_prices']['1:3']}\n"
         f"Fees ~{m['fees']['pct_of_risk']}% of risk\n\n"
         f"Manage: breakeven stop at {breakeven} (1R), then trail behind each "
-        f"new 4H swing — this is the DEFAULT suggestion now, not just one "
-        f"option among several: it backtested clearly better than a fixed "
-        f"1:2 (25mo out-of-sample: BTC +0.68R/trade vs +0.50R fixed, ETH "
-        f"+0.60R/trade vs +0.24R fixed — see memory for the full numbers). "
+        f"new 4H swing — the default, but NOT unconditional. On corrected "
+        f"out-of-sample data trailing beats a fixed 1:2 overall (+128R vs "
+        f"+49R across two windows) and that edge is almost entirely from "
+        f"TRENDING markets; in chop the fixed 1:2 actually won (+21R vs "
+        f"+13R). So if price has been chopping rather than trending, taking "
+        f"the full position at 1:2 is a reasonable call, not a mistake. "
         f"Half off at 1:2 if you want something locked in early, rest "
         f"trailed; or trail the whole position with no fixed TP at all. "
         f"Decide now, don't wait until it's already in profit.\n"
