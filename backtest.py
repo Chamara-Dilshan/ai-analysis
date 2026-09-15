@@ -118,6 +118,17 @@ def funding_bucket(trade):
     return "very-crowded"
 
 
+def rsi_side(trade):
+    """Was the RSI divergence at the entry pivot on the trade's own side?
+    A bearish divergence under a long is *against* it, so the raw bullish /
+    bearish label only means something once paired with direction."""
+    d = trade.get("rsi_div")
+    if d in (None, "none"):
+        return "none"
+    wanted = "bullish" if trade["direction"] == "long" else "bearish"
+    return "same-side" if d == wanted else "opposite"
+
+
 def simulate(candles_1h, start_idx, direction, entry, stop, max_hours=240):
     """Walk forward from the bar after entry to the first of stop or 1:2.
 
@@ -227,7 +238,7 @@ def simulate_trailing(candles, start_idx, direction, entry, stop,
 
 async def backtest(symbol: str, months: int, start_date=None, end_date=None,
                     mode: str = "reversal", exit_style: str = "fixed",
-                   funding_filter: float = 0.0):
+                   funding_filter: float = 0.0, rsi_filter: str = "off"):
     """start_date/end_date make an out-of-sample run possible: the tuning was
     done on the most recent 18 months, so testing on an earlier window is the
     only way to tell a real edge from a fitted one.
@@ -260,7 +271,11 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
     c4h, t4h = await fetch_history(symbol, "4h", s_ms, e_ms)
     c1d, t1d = await fetch_history(symbol, "1d", s_ms, e_ms)
     f_times, f_rates = await fetch_funding_history(symbol, s_ms, e_ms)
-    funding_filtered = 0
+    funding_filtered = rsi_filtered = 0
+    # Pre-registered pairing: divergence on the timeframe the entry keys off —
+    # 4H for continuation (the pivot the BOS breaks from), 1H for reversal
+    # (the pullback low/high itself). --rsi-filter overrides for diagnosis.
+    rsi_tf = rsi_filter if rsi_filter != "off" else ("4h" if mode == "continuation" else "1h")
     print(f"{symbol}: {len(c1h)} 1H, {len(c4h)} 4H, {len(c1d)} 1D candles")
 
     begin_ms = int(start.timestamp() * 1000)
@@ -323,6 +338,19 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
                     # Pre-registered rule: do not join a crowded side.
                     funding_filtered += 1
                     continue
+            # Regular RSI divergence at the latest confirmed pivot, computed on
+            # history up to this bar only. Recorded on every trade for the
+            # breakdown; enforced only when --rsi-filter is on.
+            rsi_candles = c4h_slice if rsi_tf == "4h" else c1h[max(0, i - 199):i + 1]
+            div = structure.rsi_divergence(rsi_candles)
+            rsi_div = div["type"] if div else "none"
+            if rsi_filter != "off":
+                wanted = "bullish" if setup["direction"] == "long" else "bearish"
+                if rsi_div != wanted:
+                    # Pre-registered rule: only take a setup the pivot's
+                    # momentum already disagrees with price on.
+                    rsi_filtered += 1
+                    continue
             if mode == "continuation" and exit_style == "trailing":
                 # event["index"] is relative to c4h_slice, not the full c4h
                 # list — map it back so simulate_trailing walks real candles.
@@ -359,6 +387,7 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
                 "range_pct": (st4h.get("premium_discount") or {}).get("position_pct"),
                 "weekday": now.strftime("%a"),
                 "funding": funding_at_entry,
+                "rsi_div": rsi_div,
                 "risk_pct_used": risk_pct_used,
                 # Actual $ at Chamara's $200 capital and the risk % this
                 # specific trade used — for continuation trades that can be
@@ -368,6 +397,7 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
             busy_until = i + hours
 
     gate_hits["_funding_filtered"] = funding_filtered
+    gate_hits["_rsi_filtered"] = rsi_filtered
     return trades, gate_hits, sum(1 for t in t1h if t >= begin_ms)
 
 
@@ -407,6 +437,12 @@ def report(symbol, trades, gate_hits, bars):
     filtered = gate_hits.pop("_funding_filtered", 0)
     if filtered:
         print(f"Funding filter removed {filtered} setups before entry.")
+    rsi_removed = gate_hits.pop("_rsi_filtered", 0)
+    if rsi_removed:
+        # Counted per hourly evaluation: with no trade opened there is no busy
+        # window, so one still-fresh setup is rejected again every hour. This
+        # is NOT a count of distinct setups — compare "Setups fired" instead.
+        print(f"RSI-divergence filter rejected {rsi_removed} ready hourly evaluations.")
     print("Gate pass rate (share of hours each gate was satisfied):")
     for g, n in sorted(gate_hits.items(), key=lambda kv: -kv[1]):
         print(f"  {g:12s} {n:6d}  {100 * n / max(bars, 1):5.1f}%")
@@ -434,11 +470,13 @@ def report(symbol, trades, gate_hits, bars):
     for t in trades:
         t["depth"] = depth_bucket(t)
         t["funding_bucket"] = funding_bucket(t)
+        t["rsi_side"] = rsi_side(t)
     breakdown(trades, "direction", "direction")
     breakdown(trades, "session", "session")
     breakdown(trades, "zone_kind", "zone type")
     breakdown(trades, "depth", "entry depth in 4H range")
     breakdown(trades, "funding_bucket", "funding at entry (crowd on my side?)")
+    breakdown(trades, "rsi_side", "RSI divergence at the entry pivot (on my side?)")
 
     print("\n  date              dir    entry      stop    result   hrs")
     for t in trades[-5:]:
@@ -459,6 +497,13 @@ async def main():
     ap.add_argument("--funding-filter", dest="funding_filter", type=float, default=0.0,
                     help="Skip setups where funding (%% per 8h) is >= this on the "
                          "trade's own side, e.g. 0.03. 0 disables.")
+    ap.add_argument("--rsi-filter", dest="rsi_filter", default="off",
+                    choices=["off", "1h", "4h"],
+                    help="Pre-registered hypothesis: a setup whose latest confirmed "
+                         "pivot carries a same-direction regular RSI divergence "
+                         "(lower low / higher RSI for a long, mirror for a short) "
+                         "outperforms one without. 1h/4h = require it on that "
+                         "timeframe; off = record it per trade but do not filter.")
     ap.add_argument("--exit", dest="exit_style", default="fixed",
                      choices=["fixed", "trailing"],
                      help="fixed = walk to stop or a hard 1:2 (original). "
@@ -473,7 +518,8 @@ async def main():
     symbols = [args.symbol.upper()] if args.symbol else mon.SYMBOLS
     for sym in symbols:
         trades, gates, bars = await backtest(sym, args.months, args.start, args.end,
-                                              args.mode, args.exit_style, args.funding_filter)
+                                              args.mode, args.exit_style, args.funding_filter,
+                                              args.rsi_filter)
         report(sym, trades, gates, bars)
 
 

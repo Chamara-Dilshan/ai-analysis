@@ -331,6 +331,75 @@ def atr(candles: list, period: int = 14) -> Optional[float]:
     return sum(window) / len(window)
 
 
+def _rsi_value(avg_gain: float, avg_loss: float) -> float:
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+
+
+def rsi(candles: list, period: int = 14) -> list:
+    """
+    Wilder-smoothed RSI on closes, one entry per candle — None until `period`
+    deltas exist. Wilder smoothing (not a simple mean) is what TradingView's
+    built-in RSI uses, so these values line up with what a chart shows.
+    """
+    n = len(candles)
+    out: list = [None] * n
+    if n <= period:
+        return out
+    gains = losses = 0.0
+    for i in range(1, period + 1):
+        d = candles[i]["close"] - candles[i - 1]["close"]
+        if d >= 0:
+            gains += d
+        else:
+            losses -= d
+    avg_gain, avg_loss = gains / period, losses / period
+    out[period] = _rsi_value(avg_gain, avg_loss)
+    for i in range(period + 1, n):
+        d = candles[i]["close"] - candles[i - 1]["close"]
+        avg_gain = (avg_gain * (period - 1) + max(d, 0.0)) / period
+        avg_loss = (avg_loss * (period - 1) + max(-d, 0.0)) / period
+        out[i] = _rsi_value(avg_gain, avg_loss)
+    return out
+
+
+def rsi_divergence(candles: list, period: int = 14, left: int = 2, right: int = 2,
+                   lookback: int = 30) -> Optional[dict]:
+    """
+    Regular RSI divergence between the two most recent CONFIRMED swing pivots:
+      bullish — price prints a lower swing low while RSI prints a higher low
+      bearish — price prints a higher swing high while RSI prints a lower high
+
+    Pivots come from find_swings(), so the final `right` candles can never
+    form one: evaluated on a slice that ends at "now", this cannot see the
+    future. Only a divergence whose second pivot is within `lookback` candles
+    of the end counts as current. Returns the freshest one as
+    {type, index, time, price_a, price_b, rsi_a, rsi_b}, or None.
+    """
+    values = rsi(candles, period)
+    swings = find_swings(candles, left, right)
+    n = len(candles)
+    best = None
+    for kind, label in (("low", "bullish"), ("high", "bearish")):
+        pts = [s for s in swings if s["type"] == kind and values[s["index"]] is not None]
+        if len(pts) < 2:
+            continue
+        a, b = pts[-2], pts[-1]
+        if n - 1 - b["index"] > lookback:
+            continue
+        ra, rb = values[a["index"]], values[b["index"]]
+        if kind == "low":
+            diverges = b["price"] < a["price"] and rb > ra
+        else:
+            diverges = b["price"] > a["price"] and rb < ra
+        if diverges and (best is None or b["index"] > best["index"]):
+            best = {"type": label, "index": b["index"], "time": b["time"],
+                    "price_a": a["price"], "price_b": b["price"],
+                    "rsi_a": ra, "rsi_b": rb}
+    return best
+
+
 def analyze(candles: list, swing_strength: int = 2, eq_tol_pct: float = 0.1,
             max_items: int = 5, atr_period: int = 14) -> dict:
     """
