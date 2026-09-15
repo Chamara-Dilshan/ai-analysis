@@ -457,7 +457,11 @@ def read_for_trade(r: dict, trade: dict, since_utc):
             pass
     if start is None or start == since_utc or not r.get("candles_1h"):
         return r
-    lo, hi = range_since(r["candles_1h"], start)
+    # after_only: the bar the entry sits inside also contains pre-entry price,
+    # so it cannot be used to declare this trade stopped. Costs up to an hour
+    # of delay on a genuine stop — the exchange holds the real one and this
+    # layer only reports — and removes a guaranteed false stop-out.
+    lo, hi = range_since(r["candles_1h"], start, after_only=True)
     return dict(r, bar_low=lo, bar_high=hi)
 
 
@@ -1027,11 +1031,22 @@ def format_continuation_alert(symbol: str, setup: dict, now_utc: datetime) -> st
     )
 
 
-def range_since(candles: list, since_utc, bar_hours: int = 1):
+def range_since(candles: list, since_utc, bar_hours: int = 1, after_only: bool = False):
     """(low, high) across every candle still forming at or after `since_utc`,
     plus the current forming bar. With no reference point only the forming
     bar counts. Runs are hourly at :07, so between two runs one bar
-    completes; its wicks are what the close-only check kept missing."""
+    completes; its wicks are what the close-only check kept missing.
+
+    `after_only` keeps ONLY bars that opened at or after `since_utc`, dropping
+    the bar that straddles it. For a position, that straddling bar is the one
+    the entry happened inside: part of it traded BEFORE the fill, so its low
+    cannot be attributed to the trade. Including it made a hour-1 continuation
+    entry stop itself out by construction — the stop is the forming 4H
+    candle's low, a strict subset of that same 1H bar (measured at 20.2% of
+    all firings). Returns (None, None) when nothing qualifies yet, so the
+    caller falls back to the current price, which is always a true
+    observation. Matches the backtest, which walks from the bar AFTER entry.
+    """
     if not candles:
         return None, None
     chosen = candles[-1:]
@@ -1044,10 +1059,14 @@ def range_since(candles: list, since_utc, bar_hours: int = 1):
                 continue
             if open_t.tzinfo is None:
                 open_t = open_t.replace(tzinfo=timezone.utc)
-            if open_t + timedelta(hours=bar_hours) > since_utc:
+            keep = open_t >= since_utc if after_only else (
+                open_t + timedelta(hours=bar_hours) > since_utc)
+            if keep:
                 picked.append(c)
         if picked:
             chosen = picked
+        elif after_only:
+            return None, None
     return min(c["low"] for c in chosen), max(c["high"] for c in chosen)
 
 

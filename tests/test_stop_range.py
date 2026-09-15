@@ -114,22 +114,27 @@ def test_range_since_empty_candles():
 
 # --- per-trade window: bars before the entry do not count ---------------------
 
-def test_read_for_trade_starts_at_the_trade_open_not_the_last_run():
+def test_read_for_trade_excludes_the_bar_the_entry_sits_inside():
+    """Rewritten 2026-09-16. This test used to assert the OPPOSITE — that a
+    trade opened at 10:30 was stopped by the whole 10:00 bar — which pinned
+    the defect the audit found: a bar straddling the entry also holds
+    pre-entry price, and a continuation stop IS the forming 4H low, a subset
+    of that same bar. It stopped 20.2% of firings out by construction."""
     start = datetime(2026, 9, 7, 9, 0, tzinfo=timezone.utc)
     candles = _bars(start, 3)                 # 09:00, 10:00, 11:00 (forming)
     candles[1]["low"] = 10.0                  # 10:00 bar dipped hard...
     r = {"price": 150.0, "bar_low": 10.0, "bar_high": 202.0, "candles_1h": candles}
     last_run = datetime(2026, 9, 7, 10, 7, tzinfo=timezone.utc)
-    # ...but the trade was only added at 10:30, after the dip's bar had
-    # been mostly formed. The 10:00 bar was still open at 10:30 though, so
-    # it IS in the window; only the 09:00 bar is excluded.
+    # ...but the trade was added at 10:30, and nothing says the dip came after
+    # the fill. Only the 11:00 bar, which opened after it, can be attributed.
     pos = {"opened": datetime(2026, 9, 7, 10, 30, tzinfo=timezone.utc).isoformat()}
     rr = m.read_for_trade(r, pos, last_run)
-    assert rr["bar_low"] == 10.0
-    # Added at 11:05: the 10:00 bar had closed, its dip is not ours.
+    assert rr["bar_low"] == candles[2]["low"]
+    # Added at 11:05, inside the forming bar: nothing qualifies yet, so the
+    # caller falls back to the live price rather than inventing a range.
     pos = {"opened": datetime(2026, 9, 7, 11, 5, tzinfo=timezone.utc).isoformat()}
     rr = m.read_for_trade(r, pos, last_run)
-    assert rr["bar_low"] == candles[2]["low"]
+    assert rr["bar_low"] is None and rr["bar_high"] is None
 
 
 def test_read_for_trade_without_open_time_uses_the_run_window():
