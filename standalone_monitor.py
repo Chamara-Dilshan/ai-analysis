@@ -605,6 +605,14 @@ def manage_position(pos: dict, r: dict, now_utc: datetime):
         base = entry if pos.get("breakeven_done") else stop
         current = pos.get("trail_stop") or base
         current = max(current, base) if long else min(current, base)
+        # A swing only confirms `swing_strength` candles after it forms, so by
+        # then price can already be the wrong side of it — a confirmed 4H low
+        # ABOVE a long's current price is a stop that exits the moment it is
+        # placed, and the position then reports as a win it never earned.
+        # Ignore those; the next confirmed swing on the right side will trail.
+        if candidate is not None and ((long and candidate >= price) or
+                                      (not long and candidate <= price)):
+            candidate = None
         if candidate is not None and ((long and candidate > current) or
                                       (not long and candidate < current)):
             pos["trail_stop"] = candidate
@@ -1352,7 +1360,16 @@ async def main() -> None:
     # so a milestone is announced once, not every hour.
     save_positions([p for p in positions if not p.get("closed")])
     save_paper(paper)
-    state["last_run"] = now.isoformat()
+    # Only advance the cursor if every symbol was actually examined. A fetch
+    # error skips that symbol's stop/target check for the hour; moving
+    # last_run anyway would shrink the next run's bar_low/bar_high window past
+    # the gap, so the missed hour is never re-examined and a stop touched
+    # inside it goes unseen. Holding the cursor makes the next run cover both.
+    if failures == 0:
+        state["last_run"] = now.isoformat()
+    else:
+        lines.append(f"last_run held at {state.get('last_run')} — "
+                     f"{failures} symbol(s) failed, next run re-covers this hour")
 
     lines.append(footer(now))
     log("\n".join(lines))
