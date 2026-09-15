@@ -764,11 +764,55 @@ def evaluate_setup(r: dict, now_utc: datetime, news_blocked: bool = False):
             "entry": entry, "stop": stop, "fee_pct": fee_pct}
 
 
+def _structural_stop(candles_4h: list, event_index: int, long: bool,
+                     swing_strength: int, candle_stop: float) -> float:
+    """Nearest CONFIRMED 4H swing low (long) / high (short) before the breakout
+    candle, never tighter than the breakout candle's own extreme. Only candles
+    up to the breakout are consulted and a swing needs `swing_strength`
+    candles on both sides, so anything returned was fully formed before the
+    break — no look-ahead. Falls back to the candle stop if no swing exists."""
+    swings = structure.find_swings(candles_4h[:event_index + 1], swing_strength, swing_strength)
+    kind = "low" if long else "high"
+    pts = [s["price"] for s in swings if s["type"] == kind and s["index"] < event_index]
+    if not pts:
+        return candle_stop
+    return min(candle_stop, pts[-1]) if long else max(candle_stop, pts[-1])
+
+
+def _continuation_fee(entry: float, stop: float):
+    """(fee % of risk, risk % used) for a continuation stop, sized to Binance's
+    minimum notional when 2% would fall short. fee is None if the math fails."""
+    sl_distance_pct = abs(entry - stop) / entry * 100
+    min_risk_pct = round(risk.MIN_NOTIONAL_USD * sl_distance_pct / CAPITAL, 3)
+    risk_pct_used = max(RISK_PCT, min_risk_pct)
+    try:
+        m = risk.position_size(entry=entry, stop_loss=stop, capital=CAPITAL,
+                                risk_pct=risk_pct_used, leverage=LEVERAGE)
+        return m["fees"]["pct_of_risk"], risk_pct_used
+    except Exception:
+        return None, risk_pct_used
+
+
 def evaluate_trend_continuation_setup(trend_1d: str, event_4h: dict, candles_4h: list,
                                        price: float, now_utc: datetime,
-                                       news_blocked: bool = False):
+                                       news_blocked: bool = False,
+                                       max_fee_pct: float = None,
+                                       stop_mode: str = "candle",
+                                       swing_strength: int = 3):
     """Trend-continuation entry: trade a fresh 4H BOS immediately, without
     waiting for the pullback evaluate_setup() requires.
+
+    `max_fee_pct` (default MAX_FEE_PCT_OF_RISK) and `stop_mode` exist for
+    backtest.py to test alternatives without touching live behaviour:
+      candle    — stop at the breakout candle's own low/high (live default)
+      structure — stop at the nearest confirmed 4H swing before the break,
+                  never tighter than the candle stop
+      hybrid    — candle stop, widened to the structural one only when the
+                  candle stop fails the fee gate
+    Added 2026-09-15 after the VM log showed the week's only real setup
+    (ETH 2026-09-14 20:00 BOS) pass every gate except fee_ok because the
+    breakout candle was small. `swing_strength` must match whatever produced
+    `candles_4h`'s structure (check_symbol uses 3 on 4H).
 
     Added 2026-08-29. The 2026-08-19->08-28 rally (BTC ~$65k->$81.5k, ETH
     ~$1,900->$2,566) went almost entirely uncaptured by evaluate_setup —
@@ -821,34 +865,38 @@ def evaluate_trend_continuation_setup(trend_1d: str, event_4h: dict, candles_4h:
 
     breakout = candles_4h[event_4h["index"]]
     entry = price
-    stop = breakout["low"] if direction == "long" else breakout["high"]
+    long = direction == "long"
+    candle_stop = breakout["low"] if long else breakout["high"]
+    stop = candle_stop
+    if stop_mode == "structure":
+        stop = _structural_stop(candles_4h, event_4h["index"], long, swing_strength, candle_stop)
 
-    # Sanity: the breakout candle's own range must still put the stop on the
-    # correct side of entry. Can fail if price has already round-tripped
-    # past the breakout candle's opposite extreme by the time this runs.
-    valid_side = (stop < entry) if direction == "long" else (stop > entry)
+    # Sanity: the stop must still sit on the correct side of entry. Can fail
+    # if price has already round-tripped past the breakout candle's opposite
+    # extreme by the time this runs.
+    valid_side = (stop < entry) if long else (stop > entry)
     gates["stop_valid"] = valid_side
     if not valid_side:
         return {"ready": False, "gates": gates, "direction": direction}
 
-    sl_distance_pct = abs(entry - stop) / entry * 100
-    min_risk_pct = round(risk.MIN_NOTIONAL_USD * sl_distance_pct / CAPITAL, 3)
-    risk_pct_used = max(RISK_PCT, min_risk_pct)
+    cap = MAX_FEE_PCT_OF_RISK if max_fee_pct is None else max_fee_pct
+    fee_pct, risk_pct_used = _continuation_fee(entry, stop)
+    gates["fee_ok"] = fee_pct is not None and fee_pct <= cap
 
-    fee_pct = None
-    try:
-        m = risk.position_size(entry=entry, stop_loss=stop, capital=CAPITAL,
-                                risk_pct=risk_pct_used, leverage=LEVERAGE)
-        fee_pct = m["fees"]["pct_of_risk"]
-        gates["fee_ok"] = fee_pct <= MAX_FEE_PCT_OF_RISK
-    except Exception:
-        gates["fee_ok"] = False
+    if not gates["fee_ok"] and stop_mode == "hybrid":
+        wider = _structural_stop(candles_4h, event_4h["index"], long, swing_strength, candle_stop)
+        if wider != stop:
+            stop = wider
+            fee_pct, risk_pct_used = _continuation_fee(entry, stop)
+            gates["fee_ok"] = fee_pct is not None and fee_pct <= cap
 
     return {
         "ready": all(gates.values()), "gates": gates, "direction": direction,
         "entry": entry, "stop": stop, "fee_pct": fee_pct,
         "risk_pct_used": risk_pct_used,
         "risk_unusually_high": risk_pct_used > 6.0,
+        "stop_source": "structure" if stop != candle_stop else "candle",
+        "stop_dist_pct": abs(entry - stop) / entry * 100,
         "event": event_4h,
     }
 

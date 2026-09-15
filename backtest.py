@@ -36,17 +36,41 @@ MS_PER_HOUR = 3_600_000
 BINANCE_MAX = 1500
 
 
+async def _get_retry(path, params, attempts=4):
+    """server._get raises RuntimeError on any network error; one blip must not
+    kill a 25-month replay (it killed five at once on 2026-09-15). 2/4/8s."""
+    for n in range(attempts):
+        try:
+            return await server._get(server.BINANCE_BASE_URL, path, params, cache_ttl=0)
+        except RuntimeError:
+            if n == attempts - 1:
+                raise
+            await asyncio.sleep(2 ** (n + 1))
+
+
+def forming_candle(c1h, t1h, open_ms, i):
+    """The higher-timeframe candle that opened at open_ms, built only from the
+    1H bars that have printed by bar i — the still-forming candle exactly as
+    Binance serves it to the live monitor mid-candle. None if it has not
+    opened yet at bar i."""
+    j = bisect.bisect_left(t1h, open_ms)
+    if j > i:
+        return None
+    bars = c1h[j:i + 1]
+    return {"open_time": server._iso_ms(open_ms), "open": bars[0]["open"],
+            "high": max(b["high"] for b in bars), "low": min(b["low"] for b in bars),
+            "close": bars[-1]["close"], "volume": sum(b["volume"] for b in bars)}
+
+
 async def fetch_history(symbol: str, interval: str, start_ms: int, end_ms: int):
     """Paginated kline fetch. server._fetch_klines caps at 500 with no date
     range, which is fine live and useless for a backtest."""
     out, cursor = [], start_ms
     while cursor < end_ms:
-        raw = await server._get(
-            server.BINANCE_BASE_URL, "/fapi/v1/klines",
+        raw = await _get_retry(
+            "/fapi/v1/klines",
             {"symbol": symbol, "interval": interval, "startTime": cursor,
-             "endTime": end_ms, "limit": BINANCE_MAX},
-            cache_ttl=0,
-        )
+             "endTime": end_ms, "limit": BINANCE_MAX})
         if not raw:
             break
         out.extend(raw)
@@ -73,11 +97,9 @@ async def fetch_funding_history(symbol: str, start_ms: int, end_ms: int):
     (times_ms, rate_pct) sorted by time, rate as a percent per 8h."""
     times, rates, cursor = [], [], start_ms
     while cursor < end_ms:
-        raw = await server._get(
-            server.BINANCE_BASE_URL, "/fapi/v1/fundingRate",
-            {"symbol": symbol, "startTime": cursor, "endTime": end_ms, "limit": 1000},
-            cache_ttl=0,
-        )
+        raw = await _get_retry(
+            "/fapi/v1/fundingRate",
+            {"symbol": symbol, "startTime": cursor, "endTime": end_ms, "limit": 1000})
         if not raw:
             break
         for row in raw:
@@ -156,7 +178,7 @@ def simulate(candles_1h, start_idx, direction, entry, stop, max_hours=240):
 
 
 def simulate_trailing(candles, start_idx, direction, entry, stop,
-                       swing_strength=2, max_candles=120):
+                       swing_strength=2, max_candles=120, first_candle=None):
     """Timeframe-agnostic alternative to simulate()'s fixed 1:2 exit. Added
     2026-08-29 for continuation trades, extended the same day to reversal
     trades too — same policy, just fed a different candle list (4H +
@@ -181,43 +203,53 @@ def simulate_trailing(candles, start_idx, direction, entry, stop,
     position if it never reached 1:2). `candles_held` is in units of
     whatever `candles` the caller passed (4H for continuation, 1H for
     reversal) — convert to real hours at the call site if needed.
+
+    `first_candle`, if given, is the post-entry remainder of the candle the
+    trade was opened inside (built from 1H bars after the entry bar). It is
+    checked for stop / 1:2 / 1R before the walk starts at start_idx + 1, and
+    never used for trailing. Without it the walk either skipped those hours
+    or credited the entry candle's pre-entry range — both wrong.
     """
     risk = abs(entry - stop)
     if risk <= 0:
         return "open", 0.0, 0
     long = direction == "long"
     target_2r = entry + 2 * risk if long else entry - 2 * risk
-    current_stop = stop
-    breakeven_done = partial_done = False
-    partial_r = 0.0
+    state = {"stop": stop, "breakeven": False, "partial": False, "partial_r": 0.0}
 
     def r_at(price):
         return (price - entry) / risk if long else (entry - price) / risk
+
+    def check(c):
+        """Stop / 1:2 / 1R for one candle, pessimistic when a single candle
+        covers both (same convention as simulate()). Returns (outcome,
+        total_r) when the trade ends on this candle, else None."""
+        hit_stop = c["low"] <= state["stop"] if long else c["high"] >= state["stop"]
+        hit_2r = c["high"] >= target_2r if long else c["low"] <= target_2r
+        if hit_stop:
+            total = state["partial_r"] + (0.5 if state["partial"] else 1.0) * r_at(state["stop"])
+            return ("win" if total > 0 else "loss"), total
+        if hit_2r and not state["partial"]:
+            state.update(partial=True, partial_r=0.5 * 2.0, stop=entry, breakeven=True)
+        elif not state["breakeven"]:
+            hit_1r = c["high"] >= entry + risk if long else c["low"] <= entry - risk
+            if hit_1r:
+                state.update(stop=entry, breakeven=True)
+        return None
+
+    if first_candle is not None:
+        ended = check(first_candle)
+        if ended:
+            return ended[0], ended[1], 0
 
     last_idx = min(start_idx + max_candles, len(candles) - 1)
     for offset in range(1, max_candles + 1):
         i = start_idx + offset
         if i >= len(candles):
             break
-        c = candles[i]
-        hit_stop = c["low"] <= current_stop if long else c["high"] >= current_stop
-        hit_2r = c["high"] >= target_2r if long else c["low"] <= target_2r
-
-        # Pessimistic when one candle covers both, same convention as simulate().
-        if hit_stop:
-            total = partial_r + (0.5 if partial_done else 1.0) * r_at(current_stop)
-            return ("win" if total > 0 else "loss"), total, offset
-
-        if hit_2r and not partial_done:
-            partial_done = True
-            partial_r = 0.5 * 2.0
-            current_stop = entry
-            breakeven_done = True
-        elif not breakeven_done:
-            hit_1r = c["high"] >= entry + risk if long else c["low"] <= entry - risk
-            if hit_1r:
-                current_stop = entry
-                breakeven_done = True
+        ended = check(candles[i])
+        if ended:
+            return ended[0], ended[1], offset
 
         # Trail behind the latest swing confirmed using only history up to
         # here — find_swings needs `swing_strength` candles either side, so
@@ -227,18 +259,19 @@ def simulate_trailing(candles, start_idx, direction, entry, stop,
         pivots = [s["price"] for s in swings if s["type"] == ("low" if long else "high")]
         if pivots:
             candidate = pivots[-1]
-            if (long and candidate > current_stop) or (not long and candidate < current_stop):
-                current_stop = candidate
+            if (long and candidate > state["stop"]) or (not long and candidate < state["stop"]):
+                state["stop"] = candidate
 
     # Ran out of data or hit max_candles — still open, valued at the last close.
     last_close = candles[last_idx]["close"]
-    total = partial_r + (0.5 if partial_done else 1.0) * r_at(last_close)
+    total = state["partial_r"] + (0.5 if state["partial"] else 1.0) * r_at(last_close)
     return "open", total, min(max_candles, last_idx - start_idx)
 
 
 async def backtest(symbol: str, months: int, start_date=None, end_date=None,
                     mode: str = "reversal", exit_style: str = "fixed",
-                   funding_filter: float = 0.0, rsi_filter: str = "off"):
+                   funding_filter: float = 0.0, rsi_filter: str = "off",
+                   fee_cap: float = None, stop_mode: str = "candle"):
     """start_date/end_date make an out-of-sample run possible: the tuning was
     done on the most recent 18 months, so testing on an earlier window is the
     only way to tell a real edge from a fitted one.
@@ -255,6 +288,13 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
     at 1R, half off at 1:2, the rest trailed behind new swings — applies to
     both modes now (added for reversal 2026-08-29 after it clearly beat fixed
     for continuation).
+
+    Since 2026-09-15 the 4H and 1D candle under evaluation is rebuilt every
+    hour from the 1H bars printed so far, because that is what the live
+    monitor sees: Binance serves the still-forming candle with its values so
+    far. Replaying the completed candle leaked its final close and low into
+    the hours before they existed — every continuation number reported
+    before this date carries that optimism, most of all for tight stops.
     """
     if start_date and end_date:
         start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
@@ -282,9 +322,6 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
 
     trades, gate_hits = [], {}
     busy_until = -1
-    cached_4h_idx = cached_1d_idx = -1
-    st4h = st1d = None
-    c4h_slice = []  # the exact slice st4h was built from — event["index"] indexes into this
 
     for i, bar in enumerate(c1h):
         if t1h[i] < begin_ms or i < 200:
@@ -294,25 +331,26 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
 
         now = datetime.fromtimestamp(t1h[i] / 1000, tz=timezone.utc)
 
-        # Higher-timeframe structure only changes when its candle changes, so
-        # recompute on the boundary instead of every hour.
         i4 = bisect.bisect_right(t4h, t1h[i]) - 1
         i1 = bisect.bisect_right(t1d, t1h[i]) - 1
         if i4 < 20 or i1 < 20:
             continue
-        if i4 != cached_4h_idx:
-            c4h_slice = c4h[max(0, i4 - 199):i4 + 1]
-            st4h = structure.analyze(c4h_slice, swing_strength=3)
-            cached_4h_idx = i4
-        if i1 != cached_1d_idx:
-            st1d = structure.analyze(c1d[max(0, i1 - 179):i1 + 1], swing_strength=2)
-            cached_1d_idx = i1
+        # The last 4H / 1D candle is still forming at this hour. Build it from
+        # the 1H bars seen so far instead of using the completed candle, so
+        # structure, freshness and the breakout-candle stop all see exactly
+        # what check_symbol() would have seen live. event["index"] indexes
+        # into c4h_slice, whose last element is that forming candle.
+        c4h_slice = c4h[max(0, i4 - 199):i4] + [forming_candle(c1h, t1h, t4h[i4], i)]
+        st4h = structure.analyze(c4h_slice, swing_strength=3)
+        c1d_slice = c1d[max(0, i1 - 179):i1] + [forming_candle(c1h, t1h, t1d[i1], i)]
+        st1d = structure.analyze(c1d_slice, swing_strength=2)
 
         price = bar["close"]
 
         if mode == "continuation":
             setup = mon.evaluate_trend_continuation_setup(
-                st1d.get("trend"), mon.latest_event(st4h), c4h_slice, price, now)
+                st1d.get("trend"), mon.latest_event(st4h), c4h_slice, price, now,
+                max_fee_pct=fee_cap, stop_mode=stop_mode)
         else:
             st1h = structure.analyze(c1h[max(0, i - 199):i + 1], swing_strength=2)
             r = {
@@ -352,14 +390,26 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
                     rsi_filtered += 1
                     continue
             if mode == "continuation" and exit_style == "trailing":
-                # event["index"] is relative to c4h_slice, not the full c4h
-                # list — map it back so simulate_trailing walks real candles.
-                ev = setup["event"]
-                full_breakout_idx = max(0, i4 - 199) + ev["index"]
+                # Entry is at 1H bar i, inside 4H candle i4. Only the bars
+                # after i in that candle can stop or pay the trade, so they go
+                # in as one partial candle; the walk then continues on
+                # completed 4H candles from i4 + 1.
+                span_end = t4h[i4] + 4 * 3600 * 1000
+                k = i + 1
+                while k < len(c1h) and t1h[k] < span_end:
+                    k += 1
+                rem = c1h[i + 1:k]
+                first = None
+                if rem:
+                    first = {"open_time": rem[0]["open_time"], "open": rem[0]["open"],
+                             "high": max(b["high"] for b in rem),
+                             "low": min(b["low"] for b in rem),
+                             "close": rem[-1]["close"],
+                             "volume": sum(b["volume"] for b in rem)}
                 outcome, rr, candles_held = simulate_trailing(
-                    c4h, full_breakout_idx, setup["direction"],
-                    setup["entry"], setup["stop"], swing_strength=2, max_candles=120)
-                hours = candles_held * 4  # simulate_trailing walked 4H candles here
+                    c4h, i4, setup["direction"], setup["entry"], setup["stop"],
+                    swing_strength=2, max_candles=120, first_candle=first)
+                hours = len(rem) + candles_held * 4
             elif mode == "reversal" and exit_style == "trailing":
                 # Reversal already operates directly on c1h at index i — no
                 # slice remapping needed, and 1 candle already equals 1 hour.
@@ -388,6 +438,8 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
                 "weekday": now.strftime("%a"),
                 "funding": funding_at_entry,
                 "rsi_div": rsi_div,
+                "stop_source": setup.get("stop_source", "candle"),
+                "stop_dist_pct": abs(setup["entry"] - setup["stop"]) / setup["entry"] * 100,
                 "risk_pct_used": risk_pct_used,
                 # Actual $ at Chamara's $200 capital and the risk % this
                 # specific trade used — for continuation trades that can be
@@ -432,6 +484,21 @@ def depth_bucket(t):
     return "deep-prem"
 
 
+def stop_bucket(t):
+    """How far the stop sat from entry. Fee % of risk is size-independent and
+    scales as 1/distance, so the 10% cap binds at roughly the 1% line."""
+    v = t.get("stop_dist_pct")
+    if v is None:
+        return "unknown"
+    if v < 1.0:
+        return "<1%"
+    if v < 2.0:
+        return "1-2%"
+    if v < 4.0:
+        return "2-4%"
+    return ">4%"
+
+
 def report(symbol, trades, gate_hits, bars):
     print(f"\n{'=' * 58}\n{symbol} — {bars} hourly evaluations\n{'=' * 58}")
     filtered = gate_hits.pop("_funding_filtered", 0)
@@ -471,12 +538,15 @@ def report(symbol, trades, gate_hits, bars):
         t["depth"] = depth_bucket(t)
         t["funding_bucket"] = funding_bucket(t)
         t["rsi_side"] = rsi_side(t)
+        t["stop_bucket"] = stop_bucket(t)
     breakdown(trades, "direction", "direction")
     breakdown(trades, "session", "session")
     breakdown(trades, "zone_kind", "zone type")
     breakdown(trades, "depth", "entry depth in 4H range")
     breakdown(trades, "funding_bucket", "funding at entry (crowd on my side?)")
     breakdown(trades, "rsi_side", "RSI divergence at the entry pivot (on my side?)")
+    breakdown(trades, "stop_bucket", "stop distance from entry")
+    breakdown(trades, "stop_source", "stop placed at (candle vs structure)")
 
     print("\n  date              dir    entry      stop    result   hrs")
     for t in trades[-5:]:
@@ -504,6 +574,16 @@ async def main():
                          "(lower low / higher RSI for a long, mirror for a short) "
                          "outperforms one without. 1h/4h = require it on that "
                          "timeframe; off = record it per trade but do not filter.")
+    ap.add_argument("--fee-cap", dest="fee_cap", type=float, default=None,
+                    help="Continuation only. Override MAX_FEE_PCT_OF_RISK (live 10). "
+                         "Pre-registered 2026-09-15: the fee gate is the tightest gate "
+                         "after structure; test whether 15 / 20 adds net-positive trades.")
+    ap.add_argument("--stop-mode", dest="stop_mode", default="candle",
+                    choices=["candle", "structure", "hybrid"],
+                    help="Continuation only. candle = breakout candle's own low/high "
+                         "(live). structure = nearest confirmed 4H swing before the break, "
+                         "never tighter than the candle. hybrid = candle, widened to "
+                         "structure only when the candle stop fails the fee gate.")
     ap.add_argument("--exit", dest="exit_style", default="fixed",
                      choices=["fixed", "trailing"],
                      help="fixed = walk to stop or a hard 1:2 (original). "
@@ -514,12 +594,14 @@ async def main():
 
     if args.start:
         print(f"OUT-OF-SAMPLE WINDOW {args.start} to {args.end}")
-    print(f"MODE: {args.mode}  EXIT: {args.exit_style}")
+    print(f"MODE: {args.mode}  EXIT: {args.exit_style}  "
+          f"FEE CAP: {args.fee_cap if args.fee_cap is not None else mon.MAX_FEE_PCT_OF_RISK}  "
+          f"STOP: {args.stop_mode}")
     symbols = [args.symbol.upper()] if args.symbol else mon.SYMBOLS
     for sym in symbols:
         trades, gates, bars = await backtest(sym, args.months, args.start, args.end,
                                               args.mode, args.exit_style, args.funding_filter,
-                                              args.rsi_filter)
+                                              args.rsi_filter, args.fee_cap, args.stop_mode)
         report(sym, trades, gates, bars)
 
 
