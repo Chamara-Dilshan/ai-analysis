@@ -163,15 +163,21 @@ def log(text: str) -> None:
             pass
 
 
-def send_telegram(message: str) -> None:
+def send_telegram(message: str) -> bool:
     """Best-effort Telegram push, for runs where nobody is looking at this
     machine. Credentials come from the environment only — never hard-code a
     token here. Same contract as show_toast: a notification failure must
-    never affect the monitor."""
+    never affect the monitor.
+
+    Returns True only when the message actually reached Telegram. The caller
+    uses that to decide whether an alert may be marked as already-sent: a
+    setup's dedup key never recurs, so recording it after a failed send
+    suppresses that alert forever.
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        return
+        return False
     try:
         resp = httpx.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -181,12 +187,15 @@ def send_telegram(message: str) -> None:
         )
         if resp.status_code != 200:
             log(f"(telegram failed: HTTP {resp.status_code})")
+            return False
+        return True
     except Exception as e:
         # The token is in the request URL, and some exception strings carry the
         # URL. Scrub it — this log can end up in a CI run log or an uploaded
         # artifact, which may be world-readable.
         detail = str(e).replace(token, "<token>")
         log(f"(telegram failed: {type(e).__name__}: {detail})")
+    return False
 
 
 def show_toast(title: str, message: str) -> None:
@@ -260,7 +269,11 @@ def pick_demand_zone(struct_4h: dict, price: float):
     zones = [z for z in zones if wide_enough(z[0], z[1], price)]
     if not zones:
         return None
-    top, bottom, kind = max(zones, key=lambda z: z[0])
+    # NEAREST below price, not the highest-topped. max(top) let a single wide
+    # stale FVG outrank every real zone, and its far-away bottom then failed
+    # the fee/min-notional gate — reading as "no setup" while a valid one sat
+    # right under price. Distance is measured to the edge price meets first.
+    top, bottom, kind = min(zones, key=lambda z: abs(price - z[0]))
     return {"top": top, "bottom": bottom, "kind": kind}
 
 
@@ -279,7 +292,9 @@ def pick_supply_zone(struct_4h: dict, price: float):
     zones = [z for z in zones if wide_enough(z[0], z[1], price)]
     if not zones:
         return None
-    top, bottom, kind = min(zones, key=lambda z: z[1])
+    # Nearest above price — mirror of pick_demand_zone. min(bottom) had the
+    # same defect: one wide stale zone captured the choice.
+    top, bottom, kind = min(zones, key=lambda z: abs(z[1] - price))
     return {"top": top, "bottom": bottom, "kind": kind}
 
 
@@ -423,18 +438,33 @@ def update_paper_trade(t: dict, r: dict, now_utc: datetime) -> bool:
                  closed=now_utc.isoformat(), current_stop=cur)
         return True
 
+    # Breakeven must never LOOSEN a stop the trail has already advanced past
+    # entry — manage_position guards this with max(trail, base); this copy
+    # did not, the same drift that left the price guard below unapplied here.
+    def to_breakeven(current):
+        return max(current, entry) if long else min(current, entry)
+
     hit_2r = hi >= t["target"] if long else lo <= t["target"]
     if hit_2r and not partial_done:
         t.update(partial_done=True, partial_r=1.0, breakeven_done=True)
-        cur = entry
+        cur = to_breakeven(cur)
     elif not t.get("breakeven_done"):
         one_r = entry + risk_dist if long else entry - risk_dist
         if (hi >= one_r) if long else (lo <= one_r):
             t["breakeven_done"] = True
-            cur = entry
+            cur = to_breakeven(cur)
 
-    # Trail behind the latest confirmed 4H swing. Never backwards.
+    # Trail behind the latest confirmed 4H swing. Never backwards, and never
+    # past price: a swing confirms several candles after it forms, so price
+    # may already be the wrong side of it. Parking the stop there books an
+    # exit that never traded — and always in profit, so it silently flatters
+    # the one record this project treats as untainted. Same guard as
+    # manage_position; this copy was missed when that one was fixed.
     swing = r.get("recent_low_4h") if long else r.get("recent_high_4h")
+    price_now = r.get("price")
+    if swing is not None and price_now is not None and (
+            (long and swing >= price_now) or (not long and swing <= price_now)):
+        swing = None
     if swing is not None and ((long and swing > cur) or (not long and swing < cur)):
         cur = swing
     t["current_stop"] = cur
@@ -1147,6 +1177,11 @@ async def main() -> None:
     telegram_msgs = []    # only what is worth interrupting him for
     summary = []          # one line per symbol, for the daily heartbeat
     failures = 0
+    # (state_dict, key, previous_value) for every alert dedup key written on
+    # the strength of a Telegram message that has not been sent yet. Rolled
+    # back if the send fails — a setup key never recurs, so recording one
+    # after a failed push suppresses that alert permanently.
+    pending_alert_keys = []
     positions = load_positions()
     paper = load_paper()
 
@@ -1252,6 +1287,8 @@ async def main() -> None:
                 else:
                     telegram_msgs.append(format_setup_alert(symbol, r, setup, now))
                     paper.append(record_paper_trade(symbol, setup, now))
+                    pending_alert_keys.append(
+                        (sym_state, "last_setup_key", sym_state.get("last_setup_key")))
                 sym_state["last_setup_key"] = key
                 sym_state["last_setup_at"] = now.isoformat()
             alert_lines.append(f"[SETUP READY] {symbol} {setup['direction']}")
@@ -1297,6 +1334,9 @@ async def main() -> None:
                 else:
                     telegram_msgs.append(format_continuation_alert(symbol, cont_setup, now))
                     paper.append(record_paper_trade(symbol, cont_setup, now, mode="continuation"))
+                    pending_alert_keys.append(
+                        (sym_state, "last_cont_setup_key",
+                         sym_state.get("last_cont_setup_key")))
                 sym_state["last_cont_setup_key"] = cont_key
             alert_lines.append(f"[CONTINUATION READY] {symbol} {cont_setup['direction']}")
 
@@ -1392,7 +1432,6 @@ async def main() -> None:
 
     lines.append(footer(now))
     log("\n".join(lines))
-    save_state(state)
 
     if alert_lines:
         alert_text = "\n".join(alert_lines) + "\n" + footer(now)
@@ -1403,9 +1442,24 @@ async def main() -> None:
     # Structure events and level crossings stay in the log. Only setups,
     # heads-ups and the heartbeat are worth a phone notification — an alert
     # that fires on every wiggle is an alert that gets muted.
+    sends_ok = True
     for msg in telegram_msgs:
-        send_telegram(msg)
+        if not send_telegram(msg):
+            sends_ok = False
         log("--- TELEGRAM ---\n" + msg)
+
+    # State is saved AFTER the sends so a failed push can undo its own dedup
+    # key. send_telegram never raises (it swallows its own errors), so there
+    # is no path where the rest of the state is lost by deferring this.
+    if not sends_ok and pending_alert_keys:
+        for state_ref, key_name, previous in pending_alert_keys:
+            if previous is None:
+                state_ref.pop(key_name, None)
+            else:
+                state_ref[key_name] = previous
+        log(f"(telegram send failed — rolled back {len(pending_alert_keys)} alert "
+            f"dedup key(s); the setup will alert again next run)")
+    save_state(state)
 
     # Last thing: check in with the external watchdog. If this stops
     # arriving, the service tells Chamara — covering the one failure mode
