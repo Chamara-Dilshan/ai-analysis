@@ -1121,9 +1121,16 @@ async def check_symbol(symbol: str, since_utc=None) -> dict:
     # 1H is where the entry trigger lives — without it the monitor can only
     # report that a level moved, never that a setup formed.
     candles_1h = await server._fetch_klines(symbol, "1h", 200)
-    struct_4h = structure.analyze(candles_4h, swing_strength=3)
-    struct_1d = structure.analyze(candles_1d, swing_strength=2)
-    struct_1h = structure.analyze(candles_1h, swing_strength=2)
+    # max_items defaults to 5 — a payload cap for the MCP display, where the
+    # caller only wants a readable summary. pick_demand_zone/pick_supply_zone
+    # treat this list as the COMPLETE zone universe, and analyze keeps the 5
+    # NEWEST, not the 5 nearest price. So the nearest-zone choice was being
+    # made over an arbitrary handful (measured: 5 of 17 open FVGs, 5 of 11
+    # open OBs on a real read). Ask for the lot here; the display path keeps
+    # its own default.
+    struct_4h = structure.analyze(candles_4h, swing_strength=3, max_items=100)
+    struct_1d = structure.analyze(candles_1d, swing_strength=2, max_items=100)
+    struct_1h = structure.analyze(candles_1h, swing_strength=2, max_items=100)
 
     return {
         "price": price,
@@ -1389,13 +1396,20 @@ async def main() -> None:
     # Self-reported failures: API outages, code faults, bad data. Alert once
     # on crossing the threshold rather than every hour, so a long outage does
     # not become its own spam problem.
+    # ANY symbol failing is a degraded run, not just all of them. The old
+    # all-or-nothing test meant 4 of 5 symbols erroring every hour reported
+    # "all good", pinged the healthcheck OK, and listed one symbol in the
+    # heartbeat — the monitor's whole failure mode, applied to itself.
     all_failed = failures == len(SYMBOLS)
-    streak = state.get("consecutive_failures", 0) + 1 if all_failed else 0
+    degraded = failures > 0
+    streak = state.get("consecutive_failures", 0) + 1 if degraded else 0
     state["consecutive_failures"] = streak
-    if all_failed and streak == MAX_CONSECUTIVE_FAILURES:
+    if degraded and streak == MAX_CONSECUTIVE_FAILURES:
+        scope = ("Every symbol failed" if all_failed
+                 else f"{failures} of {len(SYMBOLS)} symbols failed")
         telegram_msgs.append(
-            f"MONITOR PROBLEM — {streak} consecutive failed runs.\n"
-            f"Both symbols failed to fetch or analyse. Levels are NOT being "
+            f"MONITOR PROBLEM — {streak} consecutive degraded runs.\n"
+            f"{scope} to fetch or analyse. Those levels are NOT being "
             f"watched right now.\n"
             f"Check: ssh to the VM, then tail -20 ~/trading-analysis/monitor_log.txt\n"
             + footer(now)
@@ -1405,7 +1419,13 @@ async def main() -> None:
     # identical from the phone — which is exactly how 19 green-but-empty CI
     # runs went unnoticed.
     if now.hour == HEARTBEAT_HOUR_UTC and state.get("last_heartbeat") != now.date().isoformat():
-        health = "all good" if streak == 0 else f"WARNING: {streak} failed runs"
+        if streak:
+            health = f"WARNING: {streak} degraded runs, {failures}/{len(SYMBOLS)} symbols failing"
+        elif len(summary) < len(SYMBOLS):
+            # Never say "all good" while silently reporting fewer symbols.
+            health = f"WARNING: only {len(summary)}/{len(SYMBOLS)} symbols reported"
+        else:
+            health = "all good"
         telegram_msgs.append(
             f"Daily check-in — monitor is alive ({health}).\n\n"
             + "\n".join(summary)
@@ -1464,7 +1484,9 @@ async def main() -> None:
     # Last thing: check in with the external watchdog. If this stops
     # arriving, the service tells Chamara — covering the one failure mode
     # this process can never report on its own.
-    ping_healthcheck(ok=not all_failed)
+    # Any failed symbol means this run did not do its job — ping not-OK so the
+    # external watchdog sees a partial outage, not just a total one.
+    ping_healthcheck(ok=not degraded)
 
 
 def cli(argv) -> int:
