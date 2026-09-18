@@ -745,13 +745,19 @@ def active_kill_zone(now_utc: datetime):
     return None
 
 
-def evaluate_setup(r: dict, now_utc: datetime, news_blocked: bool = False):
+def evaluate_setup(r: dict, now_utc: datetime, news_blocked: bool = False,
+                   require_kill_zone: bool = True):
     """Check the full entry checklist, not just whether a level moved.
 
     A crossed level is an event; a setup is an event that also happens to be
     in the right direction, at the right price, at the right time, clear of
     news, and cheap enough to be worth taking. Returns a dict describing
     every gate so a near-miss is still legible in the log.
+
+    `require_kill_zone=False` exists only for backtest.py, to measure whether
+    the session window earns its place — the structural gates lined up on
+    three symbols outside the window on 2026-09-18 and were all blocked.
+    Live behaviour is unchanged by default.
     """
     gates = {}
 
@@ -784,7 +790,7 @@ def evaluate_setup(r: dict, now_utc: datetime, news_blocked: bool = False):
 
     # Gate: the plan's session windows.
     kz = active_kill_zone(now_utc)
-    gates["kill_zone"] = kz is not None
+    gates["kill_zone"] = (kz is not None) or not require_kill_zone
 
     # Gate: no high-impact release inside the blackout window. The plan
     # forbids trading through FOMC/CPI/NFP, where a stop is decoration.

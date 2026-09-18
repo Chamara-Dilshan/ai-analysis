@@ -271,7 +271,8 @@ def simulate_trailing(candles, start_idx, direction, entry, stop,
 async def backtest(symbol: str, months: int, start_date=None, end_date=None,
                     mode: str = "reversal", exit_style: str = "fixed",
                    funding_filter: float = 0.0, rsi_filter: str = "off",
-                   fee_cap: float = None, stop_mode: str = "candle"):
+                   fee_cap: float = None, stop_mode: str = "candle",
+                   require_kill_zone: bool = True):
     """start_date/end_date make an out-of-sample run possible: the tuning was
     done on the most recent 18 months, so testing on an earlier window is the
     only way to tell a real edge from a fitted one.
@@ -363,7 +364,7 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
                 "bar_low": bar["low"],
                 "bar_high": bar["high"],
             }
-            setup = mon.evaluate_setup(r, now)
+            setup = mon.evaluate_setup(r, now, require_kill_zone=require_kill_zone)
 
         for g, ok in setup["gates"].items():
             gate_hits[g] = gate_hits.get(g, 0) + (1 if ok else 0)
@@ -578,6 +579,10 @@ async def main():
                     help="Continuation only. Override MAX_FEE_PCT_OF_RISK (live 10). "
                          "Pre-registered 2026-09-15: the fee gate is the tightest gate "
                          "after structure; test whether 15 / 20 adds net-positive trades.")
+    ap.add_argument("--no-kill-zone", dest="no_kill_zone", action="store_true",
+                    help="Reversal only. Drop the London/NY session gate and take "
+                         "setups at any hour. Pre-registered 2026-09-18 after three "
+                         "symbols lined up structurally outside the window.")
     ap.add_argument("--stop-mode", dest="stop_mode", default="candle",
                     choices=["candle", "structure", "hybrid"],
                     help="Continuation only. candle = breakout candle's own low/high "
@@ -596,12 +601,14 @@ async def main():
         print(f"OUT-OF-SAMPLE WINDOW {args.start} to {args.end}")
     print(f"MODE: {args.mode}  EXIT: {args.exit_style}  "
           f"FEE CAP: {args.fee_cap if args.fee_cap is not None else mon.MAX_FEE_PCT_OF_RISK}  "
-          f"STOP: {args.stop_mode}")
+          f"STOP: {args.stop_mode}  "
+          f"KILL ZONE: {'off' if args.no_kill_zone else 'required'}")
     symbols = [args.symbol.upper()] if args.symbol else mon.SYMBOLS
     for sym in symbols:
         trades, gates, bars = await backtest(sym, args.months, args.start, args.end,
                                               args.mode, args.exit_style, args.funding_filter,
-                                              args.rsi_filter, args.fee_cap, args.stop_mode)
+                                              args.rsi_filter, args.fee_cap, args.stop_mode,
+                                              not args.no_kill_zone)
         report(sym, trades, gates, bars)
 
 
