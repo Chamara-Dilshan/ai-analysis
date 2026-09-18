@@ -503,10 +503,20 @@ def paper_summary(trades: list) -> str:
         return f"Paper record: no trades resolved yet ({open_n} open)."
     wins = [t for t in done if t["status"] == "win"]
     total_r = sum(t.get("r", 0) for t in done)
+    # Convert per trade at the risk % that trade ACTUALLY used. A flat 2% is
+    # wrong for continuation entries, which size to Binance's minimum notional
+    # and can run well above it — and R and dollars can diverge sharply when
+    # the risk % varies (a structural-stop run once showed +5.1R worth +$5,
+    # because the wins landed on small-risk trades and the losses on large).
+    # This is the record used to judge whether the system works; it should not
+    # flatter itself.
+    total_usd = sum(t.get("r", 0) * CAPITAL * t.get("risk_pct_used", RISK_PCT) / 100
+                    for t in done)
+    money = f"{'+' if total_usd >= 0 else '-'}${abs(total_usd):.2f}"
     return (
         f"Paper record: {len(done)} resolved, {len(wins)} wins "
         f"({100 * len(wins) / len(done):.0f}%), {total_r:+.1f}R "
-        f"(${total_r * CAPITAL * RISK_PCT / 100:+.2f} at your sizing). "
+        f"({money} at each trade's actual sizing). "
         f"{sum(1 for t in trades if t['status'] == 'open')} still open."
     )
 
@@ -1222,8 +1232,15 @@ async def main() -> None:
         price = r["price"]
         triggers = []
 
+        # "Price inside an open zone" was self-contradictory and never true:
+        # a zone is OPEN precisely because price has not returned to it, so
+        # bottom <= price <= top could not hold and entered_demand was dead
+        # code (was_in_demand sat at false permanently in monitor_state.json).
+        # Use the same proximity test the real gate uses, against the bar's
+        # RANGE rather than the close, so a wick into the zone counts.
         was_in = sym_state.get("was_in_demand", False)
-        in_now = bool(r["demand"] and r["demand"]["bottom"] <= price <= r["demand"]["top"])
+        in_now = bool(r["demand"]) and reached_zone(
+            r["demand"], price, r.get("bar_low"), r.get("bar_high"))
         if in_now and not was_in:
             triggers.append(("entered_demand", None))
         sym_state["was_in_demand"] = in_now
@@ -1537,7 +1554,20 @@ def cli(argv) -> int:
         if (direction == "long" and stop >= entry) or (direction == "short" and stop <= entry):
             print(f"stop {stop} is on the wrong side of entry {entry} for a {direction}")
             return 2
-        positions = [p for p in positions if p["symbol"] != sym]
+        # Refuse to silently replace a live position: doing so discards its
+        # breakeven_done / trail_stop / opened state and the trade carries on
+        # being managed as if it had just opened. Make the destructive step
+        # explicit instead of printing success over it.
+        existing = next((p for p in positions if p["symbol"] == sym), None)
+        if existing:
+            flags = [k for k in ("breakeven_done", "partial_done") if existing.get(k)]
+            print(f"{sym} is already tracked: {existing['direction']} entry "
+                  f"{existing['entry']} stop {existing.get('trail_stop', existing['stop'])}"
+                  f"{' [' + ','.join(flags) + ']' if flags else ''}, opened "
+                  f"{existing.get('opened', 'unknown')}.")
+            print(f"Close it first if you mean to replace it:  "
+                  f"standalone_monitor.py close {sym}")
+            return 2
         positions.append({"symbol": sym, "direction": direction, "entry": entry,
                            "stop": stop, "mode": mode,
                            "opened": datetime.now(timezone.utc).isoformat()})
@@ -1557,7 +1587,21 @@ def cli(argv) -> int:
             print(f"No tracked position for {sym}.")
             return 1
         save_positions(remaining)
-        print(f"Stopped tracking {sym}.")
+        # The paper trade is a separate record and stayed "open", so it kept
+        # occupying an open_slots slot against MAX_OPEN_POSITIONS forever —
+        # quietly shrinking how many new setups could ever fire.
+        freed = 0
+        for t in paper:
+            if t.get("symbol") == sym and t.get("status") == "open":
+                t.update(status="closed_manually",
+                         closed=datetime.now(timezone.utc).isoformat())
+                freed += 1
+        if freed:
+            save_paper(paper)
+        print(f"Stopped tracking {sym}."
+              + (f" Released {freed} paper slot(s); "
+                 f"{open_slots(paper, remaining)}/{MAX_OPEN_POSITIONS} now in use."
+                 if freed else ""))
         return 0
 
     print(usage)

@@ -36,6 +36,9 @@ MS_PER_HOUR = 3_600_000
 BINANCE_MAX = 1500
 
 
+CRON_OFFSET = timedelta(minutes=7)   # run-monitor.sh is scheduled at :07
+
+
 async def _get_retry(path, params, attempts=4):
     """server._get raises RuntimeError on any network error; one blip must not
     kill a 25-month replay (it killed five at once on 2026-09-15). 2/4/8s."""
@@ -330,7 +333,12 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
         if i <= busy_until:
             continue
 
-        now = datetime.fromtimestamp(t1h[i] / 1000, tz=timezone.utc)
+        # The VM's cron fires at :07, not on the bar open. Every time gate
+        # (kill zone, TRIGGER_MAX_AGE, continuation freshness) is measured
+        # against this clock, so replaying at the bar open made the backtest
+        # slightly more permissive than the live monitor can ever be —
+        # measured at 21 of 1978 continuation events (1.1%). Match live.
+        now = datetime.fromtimestamp(t1h[i] / 1000, tz=timezone.utc) + CRON_OFFSET
 
         i4 = bisect.bisect_right(t4h, t1h[i]) - 1
         i1 = bisect.bisect_right(t1d, t1h[i]) - 1
