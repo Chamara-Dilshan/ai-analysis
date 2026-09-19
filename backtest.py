@@ -275,7 +275,7 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
                     mode: str = "reversal", exit_style: str = "fixed",
                    funding_filter: float = 0.0, rsi_filter: str = "off",
                    fee_cap: float = None, stop_mode: str = "candle",
-                   require_kill_zone: bool = True):
+                   require_kill_zone: bool = True, choch_flip_hours: float = 0.0):
     """start_date/end_date make an out-of-sample run possible: the tuning was
     done on the most recent 18 months, so testing on an earlier window is the
     only way to tell a real edge from a fitted one.
@@ -359,7 +359,9 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
         if mode == "continuation":
             setup = mon.evaluate_trend_continuation_setup(
                 st1d.get("trend"), mon.latest_event(st4h), c4h_slice, price, now,
-                max_fee_pct=fee_cap, stop_mode=stop_mode)
+                max_fee_pct=fee_cap, stop_mode=stop_mode,
+                choch_flip_hours=choch_flip_hours,
+                event_1d=mon.latest_event(st1d))
         else:
             st1h = structure.analyze(c1h[max(0, i - 199):i + 1], swing_strength=2)
             r = {
@@ -447,6 +449,7 @@ async def backtest(symbol: str, months: int, start_date=None, end_date=None,
                 "weekday": now.strftime("%a"),
                 "funding": funding_at_entry,
                 "rsi_div": rsi_div,
+                "entry_kind": setup.get("entry_kind", "bos"),
                 "stop_source": setup.get("stop_source", "candle"),
                 "stop_dist_pct": abs(setup["entry"] - setup["stop"]) / setup["entry"] * 100,
                 "risk_pct_used": risk_pct_used,
@@ -556,6 +559,7 @@ def report(symbol, trades, gate_hits, bars):
     breakdown(trades, "rsi_side", "RSI divergence at the entry pivot (on my side?)")
     breakdown(trades, "stop_bucket", "stop distance from entry")
     breakdown(trades, "stop_source", "stop placed at (candle vs structure)")
+    breakdown(trades, "entry_kind", "entry event (BOS vs CHoCH-on-daily-flip)")
 
     print("\n  date              dir    entry      stop    result   hrs")
     for t in trades[-5:]:
@@ -587,6 +591,12 @@ async def main():
                     help="Continuation only. Override MAX_FEE_PCT_OF_RISK (live 10). "
                          "Pre-registered 2026-09-15: the fee gate is the tightest gate "
                          "after structure; test whether 15 / 20 adds net-positive trades.")
+    ap.add_argument("--choch-flip-hours", dest="choch_flip_hours", type=float, default=0.0,
+                    help="Continuation only. Also take a fresh 4H CHoCH when the DAILY "
+                         "flipped the same way within this many hours — the opening leg "
+                         "of a new trend, which the BOS-only rule cannot see. 0 = off. "
+                         "Pre-registered 2026-09-19 after BTC's rally off the lows "
+                         "registered as a CHoCH and was sat out from 78,047 to 81,265.")
     ap.add_argument("--no-kill-zone", dest="no_kill_zone", action="store_true",
                     help="Reversal only. Drop the London/NY session gate and take "
                          "setups at any hour. Pre-registered 2026-09-18 after three "
@@ -610,13 +620,14 @@ async def main():
     print(f"MODE: {args.mode}  EXIT: {args.exit_style}  "
           f"FEE CAP: {args.fee_cap if args.fee_cap is not None else mon.MAX_FEE_PCT_OF_RISK}  "
           f"STOP: {args.stop_mode}  "
-          f"KILL ZONE: {'off' if args.no_kill_zone else 'required'}")
+          f"KILL ZONE: {'off' if args.no_kill_zone else 'required'}  "
+          f"CHOCH-FLIP: {(str(args.choch_flip_hours) + 'h') if args.choch_flip_hours else 'off'}")
     symbols = [args.symbol.upper()] if args.symbol else mon.SYMBOLS
     for sym in symbols:
         trades, gates, bars = await backtest(sym, args.months, args.start, args.end,
                                               args.mode, args.exit_style, args.funding_filter,
                                               args.rsi_filter, args.fee_cap, args.stop_mode,
-                                              not args.no_kill_zone)
+                                              not args.no_kill_zone, args.choch_flip_hours)
         report(sym, trades, gates, bars)
 
 

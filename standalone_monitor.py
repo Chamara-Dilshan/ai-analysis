@@ -870,7 +870,9 @@ def evaluate_trend_continuation_setup(trend_1d: str, event_4h: dict, candles_4h:
                                        news_blocked: bool = False,
                                        max_fee_pct: float = None,
                                        stop_mode: str = "candle",
-                                       swing_strength: int = 3):
+                                       swing_strength: int = 3,
+                                       choch_flip_hours: float = 0.0,
+                                       event_1d: dict = None):
     """Trend-continuation entry: trade a fresh 4H BOS immediately, without
     waiting for the pullback evaluate_setup() requires.
 
@@ -913,11 +915,34 @@ def evaluate_trend_continuation_setup(trend_1d: str, event_4h: dict, candles_4h:
     """
     gates = {}
 
-    is_bos = bool(event_4h and event_4h["type"] == "BOS")
+    # A CHoCH is excluded on purpose: it is the signature of a trend CHANGING,
+    # not continuing, and taking them is what would buy every failed bounce in
+    # chop. The cost is that the FIRST leg of a genuine new trend is invisible
+    # here — BTC's 2026-09-18 rally off the lows registered as a CHoCH and the
+    # gate sat it out from $78,047 to $81,265.
+    #
+    # choch_flip_hours > 0 (backtest only) relaxes that in one narrow case: a
+    # fresh 4H CHoCH counts if the DAILY has itself just flipped the same way
+    # within that window, i.e. this is the opening leg of a new daily trend
+    # rather than another failed bounce inside an old one.
+    kind_ok = bool(event_4h) and event_4h["type"] == "BOS"
+    entry_kind = "bos"
+    if (not kind_ok and choch_flip_hours and event_4h
+            and event_4h["type"] == "CHoCH" and event_1d
+            and event_1d.get("type") == "CHoCH"
+            and event_1d.get("direction") == event_4h["direction"]):
+        try:
+            flip_age = now_utc - datetime.fromisoformat(event_1d["time"])
+            if timedelta(0) <= flip_age <= timedelta(hours=choch_flip_hours):
+                kind_ok = True
+                entry_kind = "choch-flip"
+        except Exception:
+            pass
+
     direction = None
-    if is_bos and trend_1d == "up" and event_4h["direction"] == "bullish":
+    if kind_ok and trend_1d == "up" and event_4h["direction"] == "bullish":
         direction = "long"
-    elif is_bos and trend_1d == "down" and event_4h["direction"] == "bearish":
+    elif kind_ok and trend_1d == "down" and event_4h["direction"] == "bearish":
         direction = "short"
     gates["trend_aligned_bos"] = direction is not None
 
@@ -969,6 +994,7 @@ def evaluate_trend_continuation_setup(trend_1d: str, event_4h: dict, candles_4h:
         "risk_unusually_high": risk_pct_used > 6.0,
         "stop_source": "structure" if stop != candle_stop else "candle",
         "stop_dist_pct": abs(entry - stop) / entry * 100,
+        "entry_kind": entry_kind,
         "event": event_4h,
     }
 
