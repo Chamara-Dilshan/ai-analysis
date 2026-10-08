@@ -1337,7 +1337,12 @@ async def main() -> None:
             if key != last_key or stale:
                 used = open_slots(paper, positions)
                 if used >= MAX_OPEN_POSITIONS:
-                    # Valid setup, full book. Logged, not sent.
+                    # Valid setup, full book. Logged, not sent — and NOT
+                    # recorded as alerted. Writing the key here cost a real
+                    # trade on 2026-10-08: ETH was capped at 13:07, a slot
+                    # freed at 14:07 with every gate still passing, and the
+                    # key this branch had written suppressed the send. The
+                    # dedup records what was SENT, never what was merely seen.
                     alert_lines.append(f"[SETUP CAPPED] {symbol} {setup['direction']} "
                                        f"({used} open, cap {MAX_OPEN_POSITIONS})")
                 else:
@@ -1345,8 +1350,8 @@ async def main() -> None:
                     paper.append(record_paper_trade(symbol, setup, now))
                     pending_alert_keys.append(
                         (sym_state, "last_setup_key", sym_state.get("last_setup_key")))
-                sym_state["last_setup_key"] = key
-                sym_state["last_setup_at"] = now.isoformat()
+                    sym_state["last_setup_key"] = key
+                    sym_state["last_setup_at"] = now.isoformat()
             alert_lines.append(f"[SETUP READY] {symbol} {setup['direction']}")
         elif setup["gates"].get("aligned") and setup["gates"].get("in_zone"):
             # Worth a look but not a trade: price reached the zone with the
@@ -1385,6 +1390,10 @@ async def main() -> None:
             if cont_key != sym_state.get("last_cont_setup_key"):
                 used = open_slots(paper, positions)
                 if used >= MAX_OPEN_POSITIONS:
+                    # Same rule as the reversal branch above, and the stakes
+                    # are higher here: cont_key is pinned to one 4H event and
+                    # never goes stale, so a key written while capped silenced
+                    # that break permanently, even once a slot freed.
                     alert_lines.append(f"[CONTINUATION CAPPED] {symbol} {cont_setup['direction']} "
                                        f"({used} open, cap {MAX_OPEN_POSITIONS})")
                 else:
@@ -1393,7 +1402,7 @@ async def main() -> None:
                     pending_alert_keys.append(
                         (sym_state, "last_cont_setup_key",
                          sym_state.get("last_cont_setup_key")))
-                sym_state["last_cont_setup_key"] = cont_key
+                    sym_state["last_cont_setup_key"] = cont_key
             alert_lines.append(f"[CONTINUATION READY] {symbol} {cont_setup['direction']}")
 
         demand_str = (f"{r['demand']['bottom']}-{r['demand']['top']}"
