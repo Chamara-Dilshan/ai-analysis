@@ -1226,11 +1226,19 @@ async def main() -> None:
     telegram_msgs = []    # only what is worth interrupting him for
     summary = []          # one line per symbol, for the daily heartbeat
     failures = 0
-    # (state_dict, key, previous_value) for every alert dedup key written on
-    # the strength of a Telegram message that has not been sent yet. Rolled
-    # back if the send fails — a setup key never recurs, so recording one
-    # after a failed push suppresses that alert permanently.
+    # (dict, key, previous_value) for every flag written on the strength of a
+    # Telegram message that has not been sent yet. Rolled back if the send
+    # fails — a setup key never recurs, so recording one after a failed push
+    # suppresses that alert permanently. Covers dedup keys, the daily
+    # heartbeat stamp, and a position's breakeven/trail announcement flags.
+    # It must NEVER carry pos["closed"]: a stop that was hit was hit whether
+    # or not the message arrived, and undoing it would re-close the trade.
     pending_alert_keys = []
+    # Paper trades appended this run. The journal is the one forward record no
+    # backtest bug can contaminate, so a trade recorded on the strength of a
+    # push that never landed has to come back out: the rolled-back dedup key
+    # re-alerts next run, and without this the setup would be journalled twice.
+    pending_paper_trades = []
     positions = load_positions()
     paper = load_paper()
 
@@ -1310,7 +1318,19 @@ async def main() -> None:
         # already hold is where the plan's rules actually get broken.
         for pos in positions:
             if pos["symbol"] == symbol and not pos.get("closed"):
-                for msg in manage_position(pos, read_for_trade(r, pos, last_run), now):
+                # Snapshot the flags that exist only to say a milestone was
+                # ANNOUNCED. If the push fails they have to go back, or the
+                # "move your stop" message is announced once and lost. pos
+                # ["closed"] is deliberately not among them — see above.
+                was_be = pos.get("breakeven_done")
+                was_trail = pos.get("trail_stop")
+                msgs = manage_position(pos, read_for_trade(r, pos, last_run), now)
+                if msgs:
+                    if pos.get("breakeven_done") != was_be:
+                        pending_alert_keys.append((pos, "breakeven_done", was_be))
+                    if pos.get("trail_stop") != was_trail:
+                        pending_alert_keys.append((pos, "trail_stop", was_trail))
+                for msg in msgs:
                     telegram_msgs.append(msg)
                     alert_lines.append(f"[POSITION] {msg.splitlines()[0]}")
 
@@ -1346,8 +1366,10 @@ async def main() -> None:
                     alert_lines.append(f"[SETUP CAPPED] {symbol} {setup['direction']} "
                                        f"({used} open, cap {MAX_OPEN_POSITIONS})")
                 else:
+                    trade = record_paper_trade(symbol, setup, now)
                     telegram_msgs.append(format_setup_alert(symbol, r, setup, now))
-                    paper.append(record_paper_trade(symbol, setup, now))
+                    paper.append(trade)
+                    pending_paper_trades.append(trade)
                     pending_alert_keys.append(
                         (sym_state, "last_setup_key", sym_state.get("last_setup_key")))
                     sym_state["last_setup_key"] = key
@@ -1367,6 +1389,11 @@ async def main() -> None:
                     f"Not a trade yet — no entry until those pass.\n"
                     f"{footer(now)}"
                 )
+                # Registered for rollback like the setup keys. Without this a
+                # failed push marked the zone notified forever, so the only
+                # heads-up for it was the one that never arrived.
+                pending_alert_keys.append(
+                    (sym_state, "last_headsup_key", sym_state.get("last_headsup_key")))
                 sym_state["last_headsup_key"] = str(setup["zone"])
             alert_lines.append(f"[HEADS UP] {symbol} in {setup['direction']} zone")
         else:
@@ -1397,8 +1424,11 @@ async def main() -> None:
                     alert_lines.append(f"[CONTINUATION CAPPED] {symbol} {cont_setup['direction']} "
                                        f"({used} open, cap {MAX_OPEN_POSITIONS})")
                 else:
+                    trade = record_paper_trade(symbol, cont_setup, now,
+                                               mode="continuation")
                     telegram_msgs.append(format_continuation_alert(symbol, cont_setup, now))
-                    paper.append(record_paper_trade(symbol, cont_setup, now, mode="continuation"))
+                    paper.append(trade)
+                    pending_paper_trades.append(trade)
                     pending_alert_keys.append(
                         (sym_state, "last_cont_setup_key",
                          sym_state.get("last_cont_setup_key")))
@@ -1491,12 +1521,12 @@ async def main() -> None:
             + "\nNo setup alert today means no setup, not a failure.\n"
             + footer(now)
         )
+        # Stamped only if the push lands. Marking the day done on a failed
+        # send costs the one message that distinguishes a dead monitor from
+        # a quiet market — the exact thing this heartbeat exists to catch.
+        pending_alert_keys.append((state, "last_heartbeat", state.get("last_heartbeat")))
         state["last_heartbeat"] = now.date().isoformat()
 
-    # Stopped-out trades drop off the list; everything else keeps its flags
-    # so a milestone is announced once, not every hour.
-    save_positions([p for p in positions if not p.get("closed")])
-    save_paper(paper)
     # Only advance the cursor if every symbol was actually examined. A fetch
     # error skips that symbol's stop/target check for the hour; moving
     # last_run anyway would shrink the next run's bar_low/bar_high window past
@@ -1526,17 +1556,30 @@ async def main() -> None:
             sends_ok = False
         log("--- TELEGRAM ---\n" + msg)
 
-    # State is saved AFTER the sends so a failed push can undo its own dedup
-    # key. send_telegram never raises (it swallows its own errors), so there
-    # is no path where the rest of the state is lost by deferring this.
-    if not sends_ok and pending_alert_keys:
-        for state_ref, key_name, previous in pending_alert_keys:
-            if previous is None:
-                state_ref.pop(key_name, None)
-            else:
-                state_ref[key_name] = previous
-        log(f"(telegram send failed — rolled back {len(pending_alert_keys)} alert "
-            f"dedup key(s); the setup will alert again next run)")
+    # Everything that records "he was told" is written AFTER the sends, so a
+    # failed push can undo it. send_telegram never raises (it swallows its own
+    # errors), so there is no path where this deferral loses the run's work.
+    if not sends_ok:
+        if pending_alert_keys:
+            for state_ref, key_name, previous in pending_alert_keys:
+                if previous is None:
+                    state_ref.pop(key_name, None)
+                else:
+                    state_ref[key_name] = previous
+            log(f"(telegram send failed — rolled back {len(pending_alert_keys)} alert "
+                f"flag(s); the setup will alert again next run)")
+        if pending_paper_trades:
+            # Identity, not equality: two genuine setups on the same symbol
+            # and hour would compare equal and both be dropped.
+            unsent = {id(t) for t in pending_paper_trades}
+            paper = [t for t in paper if id(t) not in unsent]
+            log(f"(telegram send failed — dropped {len(unsent)} unsent paper "
+                f"trade(s); the re-alert next run will journal them once)")
+
+    # Stopped-out trades drop off the list; everything else keeps its flags
+    # so a milestone is announced once, not every hour.
+    save_positions([p for p in positions if not p.get("closed")])
+    save_paper(paper)
     save_state(state)
 
     # Last thing: check in with the external watchdog. If this stops

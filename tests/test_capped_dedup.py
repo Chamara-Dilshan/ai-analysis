@@ -57,7 +57,8 @@ def _ready_cont():
             "entry": 2528.52, "stop": 2576.36, "target": 2432.84}
 
 
-def _run(monkeypatch, tmp_path, *, state, paper, mode="reversal", now=NOW):
+def _run(monkeypatch, tmp_path, *, state, paper, mode="reversal", now=NOW,
+         send_ok=True, positions=None, setup_ready=True):
     """Run one main() tick and report what it sent and what state it kept."""
     sent = []
 
@@ -70,11 +71,11 @@ def _run(monkeypatch, tmp_path, *, state, paper, mode="reversal", now=NOW):
 
     (tmp_path / "monitor_state.json").write_text(json.dumps(state))
     (tmp_path / "paper_trades.json").write_text(json.dumps(paper))
-    (tmp_path / "positions.json").write_text("[]")
+    (tmp_path / "positions.json").write_text(json.dumps(positions or []))
 
     monkeypatch.setattr(m, "SYMBOLS", ["ETHUSDT"])
     monkeypatch.setattr(m, "REVERSAL_SYMBOLS",
-                        ["ETHUSDT"] if mode == "reversal" else [])
+                        ["ETHUSDT"] if mode in ("reversal", "headsup") else [])
     monkeypatch.setattr(m, "CONTINUATION_SYMBOLS",
                         ["ETHUSDT"] if mode == "continuation" else [])
 
@@ -86,16 +87,26 @@ def _run(monkeypatch, tmp_path, *, state, paper, mode="reversal", now=NOW):
 
     monkeypatch.setattr(m, "check_symbol", _check_symbol)
     monkeypatch.setattr(m, "check_news_blackout", _news)
-    monkeypatch.setattr(m, "evaluate_setup",
-                        lambda *a, **k: _ready_setup() if mode == "reversal"
-                        else {"ready": False, "gates": {}, "direction": None,
-                              "zone": None})
+    def _setup(*a, **k):
+        if mode == "reversal" and setup_ready:
+            return _ready_setup()
+        if mode == "headsup":
+            # Aligned and in the zone, but the session window is shut — the
+            # exact shape that produces a HEADS UP and nothing else.
+            return {"ready": False, "direction": "short", "zone": dict(ZONE),
+                    "gates": {"aligned": True, "in_zone": True,
+                              "trigger": True, "kill_zone": False,
+                              "news_clear": True}}
+        return {"ready": False, "gates": {}, "direction": None, "zone": None}
+
+    monkeypatch.setattr(m, "evaluate_setup", _setup)
     monkeypatch.setattr(m, "evaluate_trend_continuation_setup",
                         lambda *a, **k: _ready_cont() if mode == "continuation"
                         else {"ready": False, "gates": {}, "direction": None})
     monkeypatch.setattr(m, "format_setup_alert", lambda *a, **k: "SETUP READY — ETHUSDT SHORT")
     monkeypatch.setattr(m, "format_continuation_alert", lambda *a, **k: "CONTINUATION — ETHUSDT SHORT")
-    monkeypatch.setattr(m, "send_telegram", lambda msg: sent.append(msg) or True)
+    monkeypatch.setattr(m, "send_telegram",
+                        lambda msg: sent.append(msg) or bool(send_ok))
     monkeypatch.setattr(m, "show_toast", lambda *a, **k: None)
     monkeypatch.setattr(m, "ping_healthcheck", lambda ok=True: None)
 
@@ -111,6 +122,7 @@ def _run(monkeypatch, tmp_path, *, state, paper, mode="reversal", now=NOW):
         "sent": sent,
         "state": json.loads((tmp_path / "monitor_state.json").read_text()),
         "paper": json.loads((tmp_path / "paper_trades.json").read_text()),
+        "positions": json.loads((tmp_path / "positions.json").read_text()),
         "log": (tmp_path / "monitor_log.txt").read_text(),
     }
 
@@ -206,3 +218,139 @@ def test_capped_setup_records_no_paper_trade(monkeypatch, tmp_path):
     # record would claim a trade he was never told about.
     out = _run(monkeypatch, tmp_path, state={}, paper=_full_book())
     assert [t for t in out["paper"] if t["symbol"] == "ETHUSDT"] == []
+
+
+# --------------------------------------------------------------------------- #
+# A failed push must undo everything that recorded "he was told".
+# Same family as the capped bug above: the flag outlived the message.
+# None of these had ever fired — the VM has recorded zero send failures —
+# so they are latent, which is exactly why they needed tests rather than a log.
+# --------------------------------------------------------------------------- #
+def test_a_failed_send_drops_the_unsent_paper_trade(monkeypatch, tmp_path):
+    out = _run(monkeypatch, tmp_path, state={}, paper=[], send_ok=False)
+    assert len(out["sent"]) == 1                  # attempted
+    assert out["paper"] == []                     # but not journalled
+    assert "dropped 1 unsent paper trade" in out["log"]
+    assert "last_setup_key" not in out["state"].get("ETHUSDT", {})
+
+
+def test_the_retry_after_a_failed_send_journals_the_trade_exactly_once(monkeypatch, tmp_path):
+    failed = _run(monkeypatch, tmp_path, state={}, paper=[], send_ok=False,
+                  now=NOW - timedelta(hours=1))
+    assert failed["paper"] == []
+
+    retry = _run(monkeypatch, tmp_path, state=failed["state"],
+                 paper=failed["paper"])
+    assert len(retry["sent"]) == 1
+    assert len(retry["paper"]) == 1               # one row, not two
+
+
+def test_a_successful_send_still_journals_the_trade(monkeypatch, tmp_path):
+    out = _run(monkeypatch, tmp_path, state={}, paper=[])
+    assert len(out["paper"]) == 1
+    assert out["paper"][0]["symbol"] == "ETHUSDT"
+    assert "dropped" not in out["log"]
+
+
+def test_a_failed_send_drops_an_unsent_continuation_trade(monkeypatch, tmp_path):
+    out = _run(monkeypatch, tmp_path, state={}, paper=[], mode="continuation",
+               send_ok=False)
+    assert out["paper"] == []
+    assert "last_cont_setup_key" not in out["state"].get("ETHUSDT", {})
+
+
+def test_a_failed_send_does_not_resolve_an_existing_paper_trade_away(monkeypatch, tmp_path):
+    # Only trades opened THIS run are dropped. One already on the books must
+    # survive, or a send failure would erase history.
+    prior = [{"symbol": "BTCUSDT", "mode": "reversal", "direction": "long",
+              "entry": 100.0, "stop": 95.0, "target": 110.0,
+              "status": "win", "r": 2.0, "risk_pct_used": 2}]
+    out = _run(monkeypatch, tmp_path, state={}, paper=prior, send_ok=False)
+    assert [t["symbol"] for t in out["paper"]] == ["BTCUSDT"]
+
+
+# --------------------------------------------------------------------------- #
+# heads-up key and heartbeat stamp
+# --------------------------------------------------------------------------- #
+def test_a_failed_heads_up_send_is_retried(monkeypatch, tmp_path):
+    failed = _run(monkeypatch, tmp_path, state={}, paper=[], mode="headsup",
+                  send_ok=False)
+    assert len(failed["sent"]) == 1
+    assert "last_headsup_key" not in failed["state"].get("ETHUSDT", {})
+
+    retry = _run(monkeypatch, tmp_path, state=failed["state"], paper=[],
+                 mode="headsup")
+    assert len(retry["sent"]) == 1                # he finally hears about it
+    assert retry["state"]["ETHUSDT"]["last_headsup_key"] == str(ZONE)
+
+
+def test_a_delivered_heads_up_is_not_repeated(monkeypatch, tmp_path):
+    first = _run(monkeypatch, tmp_path, state={}, paper=[], mode="headsup")
+    again = _run(monkeypatch, tmp_path, state=first["state"], paper=[],
+                 mode="headsup")
+    assert again["sent"] == []                    # same zone, stays quiet
+
+
+def test_a_failed_heartbeat_is_not_marked_as_sent(monkeypatch, tmp_path):
+    at_heartbeat = NOW.replace(hour=m.HEARTBEAT_HOUR_UTC)
+    failed = _run(monkeypatch, tmp_path, state={}, paper=[], mode="headsup",
+                  now=at_heartbeat, send_ok=False)
+    assert any("Daily check-in" in s for s in failed["sent"])
+    assert "last_heartbeat" not in failed["state"]
+
+    retry = _run(monkeypatch, tmp_path, state=failed["state"], paper=[],
+                 mode="headsup", now=at_heartbeat)
+    assert any("Daily check-in" in s for s in retry["sent"])
+    assert retry["state"]["last_heartbeat"] == at_heartbeat.date().isoformat()
+
+
+def test_a_delivered_heartbeat_is_not_repeated(monkeypatch, tmp_path):
+    at_heartbeat = NOW.replace(hour=m.HEARTBEAT_HOUR_UTC)
+    first = _run(monkeypatch, tmp_path, state={}, paper=[], mode="headsup",
+                 now=at_heartbeat)
+    again = _run(monkeypatch, tmp_path, state=first["state"], paper=[],
+                 mode="headsup", now=at_heartbeat)
+    assert not any("Daily check-in" in s for s in again["sent"])
+
+
+# --------------------------------------------------------------------------- #
+# position milestones: the announcement flag must not outlive the message,
+# but "closed" must survive, because a stop that was hit was hit either way
+# --------------------------------------------------------------------------- #
+def _open_long():
+    # price in _read() is 2528.52, so this sits at +1.57R — breakeven fires.
+    return [{"symbol": "ETHUSDT", "direction": "long", "entry": 2450.0,
+             "stop": 2400.0, "target": 2550.0, "mode": "reversal"}]
+
+
+def test_a_failed_breakeven_message_is_announced_again(monkeypatch, tmp_path):
+    failed = _run(monkeypatch, tmp_path, state={}, paper=[], mode="headsup",
+                  positions=_open_long(), send_ok=False)
+    assert any("BREAKEVEN" in s.upper() for s in failed["sent"])
+    # Flag rolled back, so the next run re-announces instead of going quiet.
+    assert not failed["positions"][0].get("breakeven_done")
+
+    retry = _run(monkeypatch, tmp_path, state=failed["state"], paper=[],
+                 mode="headsup", positions=failed["positions"])
+    assert any("BREAKEVEN" in s.upper() for s in retry["sent"])
+    assert retry["positions"][0]["breakeven_done"] is True
+
+
+def test_a_delivered_breakeven_message_is_not_repeated(monkeypatch, tmp_path):
+    first = _run(monkeypatch, tmp_path, state={}, paper=[], mode="headsup",
+                 positions=_open_long())
+    assert first["positions"][0]["breakeven_done"] is True
+    again = _run(monkeypatch, tmp_path, state=first["state"], paper=[],
+                 mode="headsup", positions=first["positions"])
+    assert not any("BREAKEVEN" in s.upper() for s in again["sent"])
+
+
+def test_a_stopped_out_trade_stays_closed_even_if_the_message_fails(monkeypatch, tmp_path):
+    # The one flag that must NOT roll back. Reopening it would leave the
+    # position tracked forever, because last_run has already moved past the
+    # hour in which the stop was touched.
+    stopped = [{"symbol": "ETHUSDT", "direction": "long", "entry": 2600.0,
+                "stop": 2590.0, "target": 2620.0, "mode": "reversal"}]
+    out = _run(monkeypatch, tmp_path, state={}, paper=[], mode="headsup",
+               positions=stopped, send_ok=False)
+    assert out["positions"] == []                 # dropped = stayed closed
