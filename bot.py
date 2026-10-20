@@ -8,6 +8,7 @@ monitor.env; every other sender is ignored.
     /took SYM long|short ENTRY STOP [reversal|continuation]   log any trade
     /closed SYM PRICE           log your exit; use the average if you scaled out
     /scorecard                  the weekly scorecard, on demand
+    /dashboard                  charts of both records, sent as an HTML file
     /pause [HOURS]              hold back setup alerts (default 24h)
     /resume                     turn setup alerts back on
     /help
@@ -40,6 +41,7 @@ HELP = (
     "/took ETH short 2531.5 2576.4 - log a trade with no alert\n"
     "/closed ETH 2463 - log your exit (average price if you scaled out)\n"
     "/scorecard - the weekly scorecard, now\n"
+    "/dashboard - charts of both records, as a file\n"
     "/pause 12 - hold back setup alerts for 12h (default 24h)\n"
     "/resume - setup alerts back on\n\n"
     "Stop, breakeven, trail and drawdown messages are never paused."
@@ -49,6 +51,7 @@ COMMANDS = [("status", "Monitor health, open trades, records"),
             ("took", "Log a trade you took: /took ETH [fill price]"),
             ("closed", "Log your exit: /closed ETH 2463"),
             ("scorecard", "Live record vs backtests, fills, skipped alerts"),
+            ("dashboard", "Charts of both records, as a file"),
             ("pause", "Hold back setup alerts: /pause [hours]"),
             ("resume", "Turn setup alerts back on"),
             ("help", "List commands")]
@@ -284,6 +287,11 @@ def handle(text: str, now: datetime = None) -> str:
                 paper = mon.load_paper()
                 return scorecard.weekly_scorecard(paper, mon.load_real(),
                                                   mon.paper_drawdown(paper)[1], now)
+            if cmd == "dashboard":
+                name, content = mon.dashboard_file(now)
+                if mon.send_document(name, content, "Open it in your browser."):
+                    return "Dashboard sent above - tap the file to open it."
+                return "Couldn't send the dashboard file. Try again in a minute."
             if cmd == "pause":
                 return cmd_pause(args, now)
             if cmd == "resume":

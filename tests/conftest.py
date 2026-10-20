@@ -11,3 +11,10 @@ def _no_exchange_info(monkeypatch):
     async def _noop():
         return None
     monkeypatch.setattr(m, "refresh_lot_steps", _noop)
+
+
+@pytest.fixture(autouse=True)
+def _no_telegram_files(monkeypatch):
+    """No test may upload a file to the real chat, even where the bot token
+    happens to be set in the environment."""
+    monkeypatch.setattr(m, "send_document", lambda *a, **k: True)

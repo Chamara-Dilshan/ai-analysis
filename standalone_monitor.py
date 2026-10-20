@@ -59,6 +59,7 @@ import httpx
 import server
 import structure
 import risk
+import dashboard
 import news
 import scorecard
 
@@ -258,6 +259,36 @@ def send_telegram(message: str) -> bool:
         detail = str(e).replace(token, "<token>")
         log(f"(telegram failed: {type(e).__name__}: {detail})")
     return False
+
+
+def send_document(filename: str, content: bytes, caption: str = "") -> bool:
+    """Send a file to the Telegram chat (the dashboard). Same contract as
+    send_telegram: True only if it arrived, and it never raises."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return False
+    try:
+        resp = httpx.post(
+            f"https://api.telegram.org/bot{token}/sendDocument",
+            data={"chat_id": chat_id, "caption": caption},
+            files={"document": (filename, content, "text/html")},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            log(f"(telegram document failed: HTTP {resp.status_code})")
+            return False
+        return True
+    except Exception as e:
+        log(f"(telegram document failed: {type(e).__name__})")
+        return False
+
+
+def dashboard_file(now_utc: datetime) -> tuple:
+    """(filename, bytes) of the dashboard built from the journals on disk."""
+    html_text = dashboard.build_dashboard(load_paper(), load_real(), now_utc,
+                                          running_version())
+    return f"dashboard-{now_utc.strftime('%Y-%m-%d')}.html", html_text.encode("utf-8")
 
 
 def show_toast(title: str, message: str) -> None:
@@ -1709,6 +1740,7 @@ async def main() -> None:
     # The weekly scorecard: the live record against what the backtests say
     # is normal for that many trades. Sundays, with the heartbeat.
     week = now.date().isoformat()
+    send_dashboard = False
     if (now.weekday() == 6 and now.hour == HEARTBEAT_HOUR_UTC
             and state.get("last_scorecard") != week):
         try:
@@ -1717,6 +1749,7 @@ async def main() -> None:
                                  + "\n" + footer(now))
             pending_alert_keys.append((state, "last_scorecard", state.get("last_scorecard")))
             state["last_scorecard"] = week
+            send_dashboard = True
         except Exception as e:
             log(f"(scorecard failed: {e!r})")
 
@@ -1801,6 +1834,16 @@ async def main() -> None:
             paper = [t for t in paper if id(t) not in unsent]
             log(f"(telegram send failed — dropped {len(unsent)} unsent paper "
                 f"trade(s); the re-alert next run will journal them once)")
+
+    # The dashboard rides along with the weekly scorecard. Best effort and
+    # outside the rollback: it is a picture of the journals, not an alert,
+    # and /dashboard can always produce another.
+    if send_dashboard and sends_ok:
+        try:
+            name, content = dashboard_file(now)
+            send_document(name, content, "Weekly dashboard - open it in your browser.")
+        except Exception as e:
+            log(f"(dashboard failed: {e!r})")
 
     # Stopped-out trades drop off the list; everything else keeps its flags
     # so a milestone is announced once, not every hour.
