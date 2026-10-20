@@ -100,3 +100,11 @@ def test_entered_demand_uses_proximity_not_impossible_containment():
     # proximity is the real question. A wick into it must count.
     assert m.reached_zone(zone, 99.2, 98.5, 99.4) is True
     assert m.reached_zone(zone, 120.0, 119.0, 121.0) is False
+
+
+def test_an_unknown_cli_command_prints_usage_instead_of_crashing(capsys):
+    # Regression: splitting cli() under the state lock left the usage text
+    # in the outer function, so a typo raised NameError instead of helping.
+    import standalone_monitor as sm
+    assert sm.cli(["nonsense"]) == 2
+    assert "usage:" in capsys.readouterr().out

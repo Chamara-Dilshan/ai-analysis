@@ -45,7 +45,6 @@ never assume it worked — check monitor_log.txt).
 """
 import asyncio
 import json
-import math
 import os
 import subprocess
 import sys
@@ -58,10 +57,62 @@ import httpx
 
 import server
 import structure
-import risk
 import dashboard
 import news
 import scorecard
+
+# Moved to their own modules 2026-10-21; re-exported so standalone_monitor.X
+# keeps working everywhere. The hourly run below still calls them by these
+# names, which is what lets the tests patch them here.
+from zones import (  # noqa: F401
+    MIN_ZONE_PCT,
+    ZONE_TOUCH_PCT,
+    is_newer,
+    latest_event,
+    latest_event_time,
+    pick_bear_confirm,
+    pick_bull_confirm,
+    pick_demand_zone,
+    pick_supply_zone,
+    range_since,
+    reached_zone,
+    wide_enough,
+)
+from gates import (  # noqa: F401
+    CAPITAL,
+    KILL_ZONES,
+    LEVERAGE,
+    MAX_FEE_PCT_OF_RISK,
+    RISK_PCT,
+    TRIGGER_MAX_AGE,
+    _continuation_fee,
+    _structural_stop,
+    active_kill_zone,
+    evaluate_setup,
+    evaluate_trend_continuation_setup,
+)
+from alerts import (  # noqa: F401
+    LOT_STEPS,
+    SL_OFFSET,
+    _fmt_qty,
+    footer,
+    format_continuation_alert,
+    format_math,
+    format_setup_alert,
+    order_ticket,
+)
+from journal import (  # noqa: F401
+    DRAWDOWN_REVIEW_USD,
+    DRAWDOWN_STOP_USD,
+    drawdown_check,
+    manage_position,
+    open_slots,
+    paper_drawdown,
+    paper_summary,
+    read_for_trade,
+    record_paper_trade,
+    update_paper_trade,
+)
 
 HERE = Path(__file__).parent
 STATE_PATH = HERE / "monitor_state.json"
@@ -96,50 +147,6 @@ SYMBOLS = list(dict.fromkeys(REVERSAL_SYMBOLS + CONTINUATION_SYMBOLS))
 # setups; anything beyond it is logged, not alerted, so the paper record
 # still shows what the cap cost or saved.
 MAX_OPEN_POSITIONS = 2
-
-# The plan's drawdown rule (Section 7, 2026-10-20), measured on the paper
-# record from its highest point. It replaced daily/weekly/monthly breaks,
-# which a portfolio replay showed cost money without reducing the drop: the
-# system's real risk is a slow bleed of ~$80-90 over months (worst tested
-# drawdowns -$78 to -$91 on $200), which no calendar limit ever sees.
-DRAWDOWN_REVIEW_USD = 60.0
-DRAWDOWN_STOP_USD = 100.0
-SL_OFFSET = timedelta(hours=5, minutes=30)
-
-# The plan's trading windows, UTC. A setup outside these is prep, not a trade.
-KILL_ZONES = (("London", 7, 9), ("New York", 13, 15))
-
-# How recent a 1H structure event must be to count as "the trigger" rather
-# than old history. Backtesting showed 3h was far too tight — structure
-# events are rarer than that, so the gate passed 0 times in 4,320 hours.
-# Half a day keeps the signal current while letting price take its time
-# reaching the zone after the turn.
-TRIGGER_MAX_AGE = timedelta(hours=12)
-
-# Capital plan — must match risk.py's defaults and the MCP server.
-CAPITAL, RISK_PCT, LEVERAGE = 200, 2, 5
-
-# Minimum zone width, as a percent of price. The raw structure engine emits
-# one-tick gaps — a $10 band on a $79k asset — and "nearest zone below price"
-# picks those far more often than real ones. Price can never be meaningfully
-# INSIDE a band that thin at the moment an hourly check runs, so without this
-# filter the setup gate is unreachable in practice.
-MIN_ZONE_PCT = 0.35
-
-# How close price must get to a zone to count as having reached it.
-#
-# This cannot be a containment test. Zones in the "open" list are open
-# precisely BECAUSE price has not traded back into them — the moment it does,
-# the engine marks them mitigated and they leave the list. So "price inside an
-# open zone" is self-contradictory and was true 0 times in 4,320 backtested
-# hours. Proximity is what the trade actually needs anyway: price arriving at
-# the zone edge, not sitting in its middle.
-ZONE_TOUCH_PCT = 0.25
-
-# Round-trip fees as a percent of the $4 risk. A very tight stop can make the
-# trade cost a fifth of what it risks, which quietly demands a much higher
-# win rate than the stated R:R suggests.
-MAX_FEE_PCT_OF_RISK = 10.0
 
 # Optional dead-man's switch. Point this at a healthchecks.io (or similar)
 # ping URL and the service alerts YOU when the monitor stops checking in —
@@ -324,112 +331,6 @@ def show_toast(title: str, message: str) -> None:
         pass
 
 
-def footer(now_utc: datetime) -> str:
-    sl = now_utc + SL_OFFSET
-    next_close_hour = ((now_utc.hour // 4) + 1) * 4
-    next_close = now_utc.replace(minute=0, second=0, microsecond=0)
-    if next_close_hour >= 24:
-        next_close = next_close.replace(hour=0) + timedelta(days=1)
-    else:
-        next_close = next_close.replace(hour=next_close_hour)
-    mins_left = int((next_close - now_utc).total_seconds() // 60)
-    sl_note = " (+1d)" if sl.date() != now_utc.date() else ""
-    return (
-        f"UTC {now_utc.strftime('%H:%M')} | "
-        f"SL {sl.strftime('%H:%M')}{sl_note} (UTC+5:30) | "
-        f"next 4H close ~{mins_left} min"
-    )
-
-
-def wide_enough(top: float, bottom: float, price: float) -> bool:
-    """Reject one-tick gaps. See MIN_ZONE_PCT."""
-    if not price:
-        return False
-    return ((top - bottom) / price) * 100 >= MIN_ZONE_PCT
-
-
-def pick_demand_zone(struct_4h: dict, price: float):
-    # Zones AT or below price: bottom <= price. The old test was top < price,
-    # which selected only zones entirely beneath the current price — so the
-    # "is price inside the zone" gate could never be true, by construction.
-    zones = []
-    for ob in struct_4h["order_blocks"]["open"]:
-        if ob["type"] == "bullish" and ob["bottom"] <= price:
-            zones.append((ob["top"], ob["bottom"], "ob"))
-    for fvg in struct_4h["fair_value_gaps"]["open"]:
-        if fvg["type"] == "bullish" and fvg["bottom"] <= price:
-            zones.append((fvg["top"], fvg["bottom"], "fvg"))
-    zones = [z for z in zones if wide_enough(z[0], z[1], price)]
-    if not zones:
-        return None
-    # NEAREST below price, not the highest-topped. max(top) let a single wide
-    # stale FVG outrank every real zone, and its far-away bottom then failed
-    # the fee/min-notional gate — reading as "no setup" while a valid one sat
-    # right under price. Distance is measured to the edge price meets first.
-    top, bottom, kind = min(zones, key=lambda z: abs(price - z[0]))
-    return {"top": top, "bottom": bottom, "kind": kind}
-
-
-def pick_supply_zone(struct_4h: dict, price: float):
-    """Mirror of pick_demand_zone — nearest bearish OB/FVG above price, for
-    when the higher timeframes are aligned short."""
-    # Mirror of pick_demand_zone: zones AT or above price, so price can be
-    # inside one rather than always strictly beneath it.
-    zones = []
-    for ob in struct_4h["order_blocks"]["open"]:
-        if ob["type"] == "bearish" and ob["top"] >= price:
-            zones.append((ob["top"], ob["bottom"], "ob"))
-    for fvg in struct_4h["fair_value_gaps"]["open"]:
-        if fvg["type"] == "bearish" and fvg["top"] >= price:
-            zones.append((fvg["top"], fvg["bottom"], "fvg"))
-    zones = [z for z in zones if wide_enough(z[0], z[1], price)]
-    if not zones:
-        return None
-    # Nearest above price — mirror of pick_demand_zone. min(bottom) had the
-    # same defect: one wide stale zone captured the choice.
-    top, bottom, kind = min(zones, key=lambda z: abs(z[1] - price))
-    return {"top": top, "bottom": bottom, "kind": kind}
-
-
-def reached_zone(zone, price: float, low: float = None, high: float = None) -> bool:
-    """Has price arrived at this zone within the last hour?
-
-    Tests the hour's RANGE against the zone, not just the close. Price often
-    tags a zone and leaves inside the same hour; a close-only test misses
-    those entirely, which understates how often the setup is really available.
-    See ZONE_TOUCH_PCT for why this is proximity rather than containment.
-    """
-    if not zone or not price:
-        return False
-    tol = price * ZONE_TOUCH_PCT / 100
-    lo = low if low is not None else price
-    hi = high if high is not None else price
-    # Range overlap between the hour's travel and the zone (plus tolerance).
-    return lo <= (zone["top"] + tol) and hi >= (zone["bottom"] - tol)
-
-
-def pick_bull_confirm(struct_4h: dict):
-    highs = [h["price"] for h in struct_4h["swings"]["recent_highs"]]
-    return max(highs) if highs else None
-
-
-def pick_bear_confirm(struct_4h: dict):
-    lows = [l["price"] for l in struct_4h["swings"]["recent_lows"]]
-    return min(lows) if lows else None
-
-
-def latest_event_time(struct: dict):
-    events = struct.get("recent_structure_events") or []
-    return events[0]["time"] if events else None
-
-
-def latest_event(struct: dict):
-    """The most recent structure event as a whole dict, so callers can see
-    direction and not just timing."""
-    events = struct.get("recent_structure_events") or []
-    return events[0] if events else None
-
-
 def load_paper() -> list:
     if PAPER_PATH.exists():
         try:
@@ -456,233 +357,6 @@ def save_real(trades: list) -> None:
     REAL_PATH.write_text(json.dumps(trades, indent=2), encoding="utf-8")
 
 
-def record_paper_trade(symbol: str, setup: dict, now_utc: datetime,
-                        mode: str = "reversal") -> dict:
-    """Log every SETUP READY as a paper trade, whether or not it gets taken.
-
-    Backtests are arguments; this is evidence. It accumulates an untuned,
-    forward-looking record at zero risk, which is the only honest way to find
-    out whether the gates are worth acting on.
-
-    `mode` tags which gate produced this trade ("reversal" or "continuation",
-    added 2026-08-29) so the two can be told apart later in paper_trades.json
-    without guessing from entry/stop shape.
-    """
-    entry, stop = setup["entry"], setup["stop"]
-    risk_dist = abs(entry - stop)
-    long = setup["direction"] == "long"
-    return {
-        "symbol": symbol,
-        "mode": mode,
-        "direction": setup["direction"],
-        "entry": entry,
-        "stop": stop,
-        "target": round(entry + 2 * risk_dist, 2) if long else round(entry - 2 * risk_dist, 2),
-        "fee_pct": setup.get("fee_pct"),
-        "risk_pct_used": setup.get("risk_pct_used", RISK_PCT),
-        "opened": now_utc.isoformat(),
-        "status": "open",
-        # Trailing state, used only when mode == "continuation". Out-of-sample
-        # the two gates want opposite exits: trailing reversal trades gave
-        # back -3.7R, trailing continuation trades added +38.9R (+52%). The
-        # stop starts where the setup put it and only moves in the trade's
-        # favour.
-        "current_stop": stop,
-        "partial_r": 0.0,
-        "breakeven_done": False,
-        "partial_done": False,
-    }
-
-
-def update_paper_trade(t: dict, r: dict, now_utc: datetime) -> bool:
-    """Resolve an open paper trade against the hour's range. Returns True if
-    it closed on this pass.
-
-    The exit depends on which gate opened the trade — the split the
-    out-of-sample backtest produced (2023-01 -> 2025-02):
-      reversal:      fixed 1:2. Trailing these gave back -3.7R; the bounce
-                     IS the trade.
-      continuation:  breakeven at 1R, half off at 1:2, trail the rest behind
-                     the latest confirmed 4H swing. Trailing added +38.9R.
-    The stop is checked first, so a bar covering both counts as a loss — the
-    pessimistic reading, identical to the backtest's convention.
-    """
-    if t["status"] != "open":
-        return False
-    lo = r.get("bar_low") or r["price"]
-    hi = r.get("bar_high") or r["price"]
-    long = t["direction"] == "long"
-    fee = (t.get("fee_pct") or 0) / 100
-
-    if t.get("mode", "reversal") != "continuation":
-        hit_stop = lo <= t["stop"] if long else hi >= t["stop"]
-        hit_target = hi >= t["target"] if long else lo <= t["target"]
-        if hit_stop:
-            t.update(status="loss", r=-1.0 - fee, closed=now_utc.isoformat())
-            return True
-        if hit_target:
-            t.update(status="win", r=2.0 - fee, closed=now_utc.isoformat())
-            return True
-        return False
-
-    # --- continuation: trail it ---
-    entry = t["entry"]
-    risk_dist = abs(entry - t["stop"])
-    if risk_dist <= 0:
-        return False
-    cur = t.get("current_stop", t["stop"])
-    partial_r = t.get("partial_r", 0.0)
-    partial_done = t.get("partial_done", False)
-
-    def r_at(price):
-        return (price - entry) / risk_dist if long else (entry - price) / risk_dist
-
-    hit_stop = lo <= cur if long else hi >= cur
-    if hit_stop:
-        total = partial_r + (0.5 if partial_done else 1.0) * r_at(cur) - fee
-        t.update(status="win" if total > 0 else "loss", r=total,
-                 closed=now_utc.isoformat(), current_stop=cur)
-        return True
-
-    # Breakeven must never LOOSEN a stop the trail has already advanced past
-    # entry — manage_position guards this with max(trail, base); this copy
-    # did not, the same drift that left the price guard below unapplied here.
-    def to_breakeven(current):
-        return max(current, entry) if long else min(current, entry)
-
-    hit_2r = hi >= t["target"] if long else lo <= t["target"]
-    if hit_2r and not partial_done:
-        t.update(partial_done=True, partial_r=1.0, breakeven_done=True)
-        cur = to_breakeven(cur)
-    elif not t.get("breakeven_done"):
-        one_r = entry + risk_dist if long else entry - risk_dist
-        if (hi >= one_r) if long else (lo <= one_r):
-            t["breakeven_done"] = True
-            cur = to_breakeven(cur)
-
-    # Trail behind the latest confirmed 4H swing. Never backwards, and never
-    # past price: a swing confirms several candles after it forms, so price
-    # may already be the wrong side of it. Parking the stop there books an
-    # exit that never traded — and always in profit, so it silently flatters
-    # the one record this project treats as untainted. Same guard as
-    # manage_position; this copy was missed when that one was fixed.
-    swing = r.get("recent_low_4h") if long else r.get("recent_high_4h")
-    price_now = r.get("price")
-    if swing is not None and price_now is not None and (
-            (long and swing >= price_now) or (not long and swing <= price_now)):
-        swing = None
-    if swing is not None and ((long and swing > cur) or (not long and swing < cur)):
-        cur = swing
-    t["current_stop"] = cur
-    return False
-
-
-def read_for_trade(r: dict, trade: dict, since_utc):
-    """Copy of the symbol read whose bar range starts no earlier than the
-    trade itself was opened. Bars that traded before the entry cannot stop
-    a trade that did not exist yet."""
-    opened = trade.get("opened")
-    start = since_utc
-    if opened:
-        try:
-            o = datetime.fromisoformat(opened)
-            if o.tzinfo is None:
-                o = o.replace(tzinfo=timezone.utc)
-            start = o if start is None else max(start, o)
-        except Exception:
-            pass
-    if start is None or start == since_utc or not r.get("candles_1h"):
-        return r
-    # after_only: the bar the entry sits inside also contains pre-entry price,
-    # so it cannot be used to declare this trade stopped. Costs up to an hour
-    # of delay on a genuine stop — the exchange holds the real one and this
-    # layer only reports — and removes a guaranteed false stop-out.
-    lo, hi = range_since(r["candles_1h"], start, after_only=True)
-    return dict(r, bar_low=lo, bar_high=hi)
-
-
-def paper_summary(trades: list) -> str:
-    """Plain-language scoreboard of the forward record so far."""
-    done = [t for t in trades if t["status"] in ("win", "loss")]
-    if not done:
-        open_n = sum(1 for t in trades if t["status"] == "open")
-        return f"Paper record: no trades resolved yet ({open_n} open)."
-    wins = [t for t in done if t["status"] == "win"]
-    total_r = sum(t.get("r", 0) for t in done)
-    # Convert per trade at the risk % that trade ACTUALLY used. A flat 2% is
-    # wrong for continuation entries, which size to Binance's minimum notional
-    # and can run well above it — and R and dollars can diverge sharply when
-    # the risk % varies (a structural-stop run once showed +5.1R worth +$5,
-    # because the wins landed on small-risk trades and the losses on large).
-    # This is the record used to judge whether the system works; it should not
-    # flatter itself.
-    total_usd = sum(t.get("r", 0) * CAPITAL * t.get("risk_pct_used", RISK_PCT) / 100
-                    for t in done)
-    money = f"{'+' if total_usd >= 0 else '-'}${abs(total_usd):.2f}"
-    return (
-        f"Paper record: {len(done)} resolved, {len(wins)} wins "
-        f"({100 * len(wins) / len(done):.0f}%), {total_r:+.1f}R "
-        f"({money} at each trade's actual sizing). "
-        f"{sum(1 for t in trades if t['status'] == 'open')} still open."
-    )
-
-
-def paper_drawdown(trades: list) -> tuple:
-    """(equity, drawdown) in USD of the resolved paper record, walked in the
-    order trades closed. Drawdown is <= 0: how far equity sits below its own
-    highest point so far, starting from the journal's $0."""
-    done = sorted((t for t in trades if t.get("status") in ("win", "loss")),
-                  key=lambda t: t.get("closed") or t.get("opened") or "")
-    equity = peak = 0.0
-    for t in done:
-        equity += t.get("r", 0) * CAPITAL * t.get("risk_pct_used", RISK_PCT) / 100
-        peak = max(peak, equity)
-    return equity, equity - peak
-
-
-def drawdown_check(trades: list, prev_level):
-    """(level, message) for the plan's drawdown rule. level is None, "review"
-    or "stop". message is set only when the level gets WORSE than prev_level,
-    so each line is announced once per drawdown. The level clears only after
-    recovering to half the review line — hovering around -$60 must not
-    re-alert every hour."""
-    _, dd = paper_drawdown(trades)
-    rank = {None: 0, "review": 1, "stop": 2}
-    if dd <= -DRAWDOWN_STOP_USD:
-        level = "stop"
-    elif dd <= -DRAWDOWN_REVIEW_USD:
-        level = "review"
-    elif dd > -DRAWDOWN_REVIEW_USD / 2:
-        level = None
-    else:
-        level = prev_level            # between the lines: hold, no flapping
-    if rank[level] <= rank.get(prev_level, 0):
-        return level, None
-    if level == "stop":
-        msg = (f"DRAWDOWN STOP — paper record is ${-dd:.2f} below its high "
-               f"(line: ${DRAWDOWN_STOP_USD:.0f}).\n"
-               "Plan Section 7: stop real-money trades. Paper only until the "
-               "record makes a new high. No backtested period ever fell this "
-               "far, so something has changed — review before going back.\n")
-    else:
-        msg = (f"DRAWDOWN REVIEW — paper record is ${-dd:.2f} below its high "
-               f"(line: ${DRAWDOWN_REVIEW_USD:.0f}).\n"
-               "Plan Section 7: keep going, but check your recent real trades "
-               "against their alerts — same entry, stop and exit? Drops of "
-               "$78-$91 happened in every tested period; this alone is not a "
-               "reason to quit.\n")
-    return level, msg
-
-
-def open_slots(paper: list, positions: list) -> int:
-    """Distinct symbols currently occupying a slot: an open paper trade (every
-    fired setup) or a tracked real position. Distinct so a real trade that
-    is also on the paper record is not counted twice."""
-    syms = {t["symbol"] for t in paper if t.get("status") == "open"}
-    syms |= {p["symbol"] for p in positions if not p.get("closed")}
-    return len(syms)
-
-
 def load_positions() -> list:
     if POSITIONS_PATH.exists():
         try:
@@ -694,158 +368,6 @@ def load_positions() -> list:
 
 def save_positions(positions: list) -> None:
     POSITIONS_PATH.write_text(json.dumps(positions, indent=2), encoding="utf-8")
-
-
-def manage_position(pos: dict, r: dict, now_utc: datetime):
-    """Watch an open trade against the plan's management rules.
-
-    The plan says: move to breakeven at 1R, take half at 1:2, and exit on an
-    opposing signal rather than waiting for the stop. Those are easy to state
-    and easy to forget at 3am, which is the whole reason to automate them.
-
-    Mutates pos to record what has already been announced, and returns a list
-    of messages worth sending.
-    """
-    msgs = []
-    price = r["price"]
-    # The bar range since the last run. Wicks hit stops; closes do not
-    # un-hit them. Falls back to the close when no range is supplied.
-    lo = r.get("bar_low") or price
-    hi = r.get("bar_high") or price
-    entry, stop = pos["entry"], pos["stop"]
-    long = pos["direction"] == "long"
-    risk_dist = abs(entry - stop)
-    if risk_dist <= 0:
-        return msgs
-
-    profit = (price - entry) if long else (entry - price)
-    r_mult = profit / risk_dist                      # where it is now
-    best = (hi - entry) if long else (entry - lo)
-    best_r = best / risk_dist                        # the best it got to
-    adverse = lo if long else hi                     # the worst it got to
-
-    # Stop breached. Reported, not second-guessed — the exchange has almost
-    # certainly closed this already.
-    # Effective stop: the original until 1R, breakeven after it, and for a
-    # continuation trade the trailed 4H swing once one has been set.
-    # Breakeven always wins over a trailed level that sits below it.
-    base = entry if pos.get("breakeven_done") else stop
-    ts = pos.get("trail_stop")
-    eff_stop = base if ts is None else (max(ts, base) if long else min(ts, base))
-    # Checked FIRST against the adverse extreme: a bar that covers both the
-    # stop and a milestone counts as stopped, the backtest's convention.
-    hit_stop = adverse <= eff_stop if long else adverse >= eff_stop
-    if hit_stop and not pos.get("closed"):
-        pos["closed"] = True
-        r_at_stop = ((eff_stop - entry) if long else (entry - eff_stop)) / risk_dist
-        if r_at_stop <= -0.999:
-            outcome = (f"Planned loss was ${round(CAPITAL * RISK_PCT / 100, 2)} "
-                       f"({RISK_PCT}% of capital). That is the system working, "
-                       f"not a failure.")
-        else:
-            outcome = (f"That stop sat at {r_at_stop:+.2f}R, so this closes flat "
-                       f"or in profit — the management rules did their job.")
-        msgs.append(
-            f"STOP HIT — {pos['symbol']} {pos['direction'].upper()}\n"
-            f"The bar traded to {adverse}, through your stop {eff_stop} "
-            f"(now ${price}).\n"
-            f"{outcome}\nRemoved from tracking. Log your exit: "
-            f"/closed {pos['symbol']} <price>\n{footer(now_utc)}"
-        )
-        return msgs
-
-    # 1R — the stop should come to breakeven so the trade cannot turn into a
-    # loser from here.
-    if best_r >= 1 and not pos.get("breakeven_done"):
-        pos["breakeven_done"] = True
-        msgs.append(
-            f"MOVE STOP TO BREAKEVEN — {pos['symbol']} {pos['direction'].upper()}\n"
-            f"Price reached 1R from entry {entry} (now ${price}, {round(r_mult, 2)}R).\n"
-            f"Move your stop to {entry}. From here the trade cannot lose.\n"
-            f"{footer(now_utc)}"
-        )
-
-    # 1:2 — the plan's first target. What happens here depends on the gate:
-    # a reversal trade is DONE (trailing them lost money out-of-sample); a
-    # continuation trade banks half and lets the rest run (trailing them
-    # added +52%).
-    mode = pos.get("mode", "reversal")
-    if best_r >= 2 and not pos.get("partial_done"):
-        pos["partial_done"] = True
-        target = round(entry + 2 * risk_dist, 2) if long else round(entry - 2 * risk_dist, 2)
-        if mode == "reversal":
-            pos["closed"] = True
-            msgs.append(
-                f"1:2 TARGET REACHED — {pos['symbol']} {pos['direction'].upper()}\n"
-                f"Price hit {target} this bar (now ${price}, {round(r_mult, 2)}R).\n"
-                f"Reversal trade: take the FULL position off here. The bounce "
-                f"is the trade — trailing reversal setups gave back profit in "
-                f"testing.\nRemoved from tracking. Log your exit: "
-                f"/closed {pos['symbol']} <price>\n{footer(now_utc)}"
-            )
-            return msgs
-        msgs.append(
-            f"1:2 TARGET REACHED — {pos['symbol']} {pos['direction'].upper()}\n"
-            f"Price hit {target} this bar (now ${price}, {round(r_mult, 2)}R).\n"
-            f"Continuation trade: take half off, stop to breakeven, and trail "
-            f"the rest behind each new 4H swing. This is the trade that pays "
-            f"for the others — let it run.\n{footer(now_utc)}"
-        )
-
-    # Continuation only: past breakeven, trail behind the latest confirmed 4H
-    # swing and say so each time it moves. A swing that would loosen the stop
-    # is ignored — the stop only ever tightens.
-    # Trails from ENTRY, not only after breakeven - that is what the
-    # backtest (+38.9R) and the paper journal both do. Waiting for 1R
-    # left a live position on its original stop while a confirmed 4H
-    # swing had already formed above it.
-    if mode == "continuation":
-        candidate = r.get("recent_low_4h") if long else r.get("recent_high_4h")
-        base = entry if pos.get("breakeven_done") else stop
-        current = pos.get("trail_stop") or base
-        current = max(current, base) if long else min(current, base)
-        # A swing only confirms `swing_strength` candles after it forms, so by
-        # then price can already be the wrong side of it — a confirmed 4H low
-        # ABOVE a long's current price is a stop that exits the moment it is
-        # placed, and the position then reports as a win it never earned.
-        # Ignore those; the next confirmed swing on the right side will trail.
-        if candidate is not None and ((long and candidate >= price) or
-                                      (not long and candidate <= price)):
-            candidate = None
-        if candidate is not None and ((long and candidate > current) or
-                                      (not long and candidate < current)):
-            pos["trail_stop"] = candidate
-            msgs.append(
-                f"MOVE STOP — {pos['symbol']} {pos['direction'].upper()}\n"
-                f"New 4H swing {'low' if long else 'high'} confirmed at {candidate}. "
-                f"Move your stop there (was {current}). Currently {round(r_mult, 2)}R.\n"
-                f"{footer(now_utc)}"
-            )
-
-    # Opposing 1H signal — the plan's exit-early rule. Announced once, and
-    # re-armed if structure turns back in favour, so a chopping 1H does not
-    # produce a stream of identical warnings.
-    ev = r.get("event_1h")
-    if ev:
-        against = "bearish" if long else "bullish"
-        opposing = ev["direction"] == against
-        try:
-            fresh = (now_utc - datetime.fromisoformat(ev["time"])) <= TRIGGER_MAX_AGE
-        except Exception:
-            fresh = False
-        if opposing and fresh and not pos.get("opposing_flagged"):
-            pos["opposing_flagged"] = True
-            msgs.append(
-                f"OPPOSING SIGNAL — {pos['symbol']} {pos['direction'].upper()}\n"
-                f"1H printed a {ev['direction']} {ev['type']} at {ev['level']}.\n"
-                f"Currently {round(r_mult, 2)}R. Your plan says exit on an "
-                f"opposing 1H signal rather than waiting for the stop.\n"
-                f"{footer(now_utc)}"
-            )
-        elif not opposing:
-            pos["opposing_flagged"] = False
-
-    return msgs
 
 
 async def check_news_blackout(now_utc: datetime):
@@ -895,281 +417,6 @@ def ping_healthcheck(ok: bool = True) -> None:
         log(f"(healthcheck ping failed: {type(e).__name__})")
 
 
-def is_newer(candidate, previous) -> bool:
-    """True if candidate is a structure-event timestamp strictly newer than
-    previous. Guards against the swing engine revising its "latest" event
-    backwards, which a simple inequality mistakes for fresh news."""
-    if not candidate:
-        return False
-    if not previous:
-        return True
-    try:
-        return datetime.fromisoformat(candidate) > datetime.fromisoformat(previous)
-    except Exception:
-        return candidate != previous
-
-
-def active_kill_zone(now_utc: datetime):
-    """Name of the kill zone we are inside, or None. Weekends never qualify —
-    the plan does not trade them."""
-    if now_utc.weekday() >= 5:
-        return None
-    for name, start, end in KILL_ZONES:
-        if start <= now_utc.hour < end:
-            return name
-    return None
-
-
-def evaluate_setup(r: dict, now_utc: datetime, news_blocked: bool = False,
-                   require_kill_zone: bool = True):
-    """Check the full entry checklist, not just whether a level moved.
-
-    A crossed level is an event; a setup is an event that also happens to be
-    in the right direction, at the right price, at the right time, clear of
-    news, and cheap enough to be worth taking. Returns a dict describing
-    every gate so a near-miss is still legible in the log.
-
-    `require_kill_zone=False` exists only for backtest.py, to measure whether
-    the session window earns its place — the structural gates lined up on
-    three symbols outside the window on 2026-09-18 and were all blocked.
-    Live behaviour is unchanged by default.
-    """
-    gates = {}
-
-    # Gate: higher timeframes agree. Trading against 1D or 4H is the single
-    # most expensive mistake available here.
-    aligned_long = r["trend_1d"] == "up" and r["trend_4h"] == "up"
-    aligned_short = r["trend_1d"] == "down" and r["trend_4h"] == "down"
-    gates["aligned"] = aligned_long or aligned_short
-    direction = "long" if aligned_long else "short" if aligned_short else None
-
-    # Gate: price is in the 4H zone we care about. For longs that is a
-    # bullish OB/FVG below price (discount); shorts are the mirror.
-    zone = r["demand"] if direction == "long" else r["supply"]
-    gates["in_zone"] = reached_zone(zone, r["price"],
-                                     r.get("bar_low"), r.get("bar_high"))
-
-    # Gate: the 1H has actually turned inside that zone. Arriving at a level
-    # proves nothing on its own — this is the trigger.
-    ev = r["event_1h"]
-    trigger_ok = False
-    if ev and direction:
-        want = "bullish" if direction == "long" else "bearish"
-        try:
-            ev_time = datetime.fromisoformat(ev["time"])
-            fresh = (now_utc - ev_time) <= TRIGGER_MAX_AGE
-        except Exception:
-            fresh = False
-        trigger_ok = ev["direction"] == want and fresh
-    gates["trigger"] = trigger_ok
-
-    # Gate: the plan's session windows.
-    kz = active_kill_zone(now_utc)
-    gates["kill_zone"] = (kz is not None) or not require_kill_zone
-
-    # Gate: no high-impact release inside the blackout window. The plan
-    # forbids trading through FOMC/CPI/NFP, where a stop is decoration.
-    gates["news_clear"] = not news_blocked
-
-    if not all(gates.values()):
-        return {"ready": False, "gates": gates, "direction": direction,
-                "zone": zone, "kill_zone": kz}
-
-    # Structural gates passed — build the trade. Stop goes just beyond the
-    # zone that is supposed to hold; if it does not hold, the reason for the
-    # trade is gone.
-    if direction == "long":
-        entry, stop = r["price"], round(zone["bottom"] * 0.999, 2)
-    else:
-        entry, stop = r["price"], round(zone["top"] * 1.001, 2)
-
-    # Gate: fees must not eat the edge. A stop tight enough to make the
-    # round trip cost a large slice of the $4 risk is a trade that needs to
-    # be right far more often than the R:R implies.
-    fee_pct = None
-    try:
-        m = risk.position_size(entry=entry, stop_loss=stop, capital=CAPITAL,
-                                risk_pct=RISK_PCT, leverage=LEVERAGE)
-        fee_pct = m["fees"]["pct_of_risk"]
-        gates["fee_ok"] = fee_pct <= MAX_FEE_PCT_OF_RISK and m["passes_plan"]
-    except Exception:
-        # If the math will not compute, do not claim the setup is ready.
-        gates["fee_ok"] = False
-
-    return {"ready": all(gates.values()), "gates": gates,
-            "direction": direction, "zone": zone, "kill_zone": kz,
-            "entry": entry, "stop": stop, "fee_pct": fee_pct}
-
-
-def _structural_stop(candles_4h: list, event_index: int, long: bool,
-                     swing_strength: int, candle_stop: float) -> float:
-    """Nearest CONFIRMED 4H swing low (long) / high (short) before the breakout
-    candle, never tighter than the breakout candle's own extreme. Only candles
-    up to the breakout are consulted and a swing needs `swing_strength`
-    candles on both sides, so anything returned was fully formed before the
-    break — no look-ahead. Falls back to the candle stop if no swing exists."""
-    swings = structure.find_swings(candles_4h[:event_index + 1], swing_strength, swing_strength)
-    kind = "low" if long else "high"
-    pts = [s["price"] for s in swings if s["type"] == kind and s["index"] < event_index]
-    if not pts:
-        return candle_stop
-    return min(candle_stop, pts[-1]) if long else max(candle_stop, pts[-1])
-
-
-def _continuation_fee(entry: float, stop: float):
-    """(fee % of risk, risk % used) for a continuation stop, sized to Binance's
-    minimum notional when 2% would fall short. fee is None if the math fails."""
-    sl_distance_pct = abs(entry - stop) / entry * 100
-    min_risk_pct = round(risk.MIN_NOTIONAL_USD * sl_distance_pct / CAPITAL, 3)
-    risk_pct_used = max(RISK_PCT, min_risk_pct)
-    try:
-        m = risk.position_size(entry=entry, stop_loss=stop, capital=CAPITAL,
-                                risk_pct=risk_pct_used, leverage=LEVERAGE)
-        return m["fees"]["pct_of_risk"], risk_pct_used
-    except Exception:
-        return None, risk_pct_used
-
-
-def evaluate_trend_continuation_setup(trend_1d: str, event_4h: dict, candles_4h: list,
-                                       price: float, now_utc: datetime,
-                                       news_blocked: bool = False,
-                                       max_fee_pct: float = None,
-                                       stop_mode: str = "candle",
-                                       swing_strength: int = 3,
-                                       choch_flip_hours: float = 0.0,
-                                       event_1d: dict = None):
-    """Trend-continuation entry: trade a fresh 4H BOS immediately, without
-    waiting for the pullback evaluate_setup() requires.
-
-    `max_fee_pct` (default MAX_FEE_PCT_OF_RISK) and `stop_mode` exist for
-    backtest.py to test alternatives without touching live behaviour:
-      candle    — stop at the breakout candle's own low/high (live default)
-      structure — stop at the nearest confirmed 4H swing before the break,
-                  never tighter than the candle stop
-      hybrid    — candle stop, widened to the structural one only when the
-                  candle stop fails the fee gate
-    Added 2026-09-15 after the VM log showed the week's only real setup
-    (ETH 2026-09-14 20:00 BOS) pass every gate except fee_ok because the
-    breakout candle was small. `swing_strength` must match whatever produced
-    `candles_4h`'s structure (check_symbol uses 3 on 4H).
-
-    Added 2026-08-29. The 2026-08-19->08-28 rally (BTC ~$65k->$81.5k, ETH
-    ~$1,900->$2,566) went almost entirely uncaptured by evaluate_setup —
-    every hourly check saw a confirmed bullish BOS but the demand-zone
-    pullback it waits for never came before price ran further. This is the
-    other half of the plan: evaluate_setup handles reversals (wait for the
-    pullback, tight stop near structure); this handles continuation (enter
-    on the break itself, wider stop at the breakout candle's own low/high).
-
-    Deliberately does NOT require price in a demand/supply zone, a separate
-    1H trigger, or a kill-zone window — the 4H BOS closing in the daily
-    trend's direction IS the trigger, and it happens on the 4H clock
-    (00/04/08/12/16/20 UTC), not London/NY hours. Requiring a kill zone here
-    would reintroduce the same "confirmed but stale by the time conditions
-    line up" gap this mode exists to fix. News blackout still applies —
-    that's about not entering into a stop-hunt candle, unrelated to entry
-    style.
-
-    Chamara's call (2026-08-29): the 2%-risk math must not gate the entry.
-    A structurally wide stop is fine — size to Binance's $100 minimum
-    notional instead of shrinking the stop or skipping the trade, and report
-    the resulting risk % plainly rather than silently forcing 2%.
-
-    `candles_4h` must be the SAME candle list/slice that produced `event_4h`
-    via structure.analyze(), since event_4h["index"] indexes into it.
-    """
-    gates = {}
-
-    # A CHoCH is excluded on purpose: it is the signature of a trend CHANGING,
-    # not continuing, and taking them is what would buy every failed bounce in
-    # chop. The cost is that the FIRST leg of a genuine new trend is invisible
-    # here — BTC's 2026-09-18 rally off the lows registered as a CHoCH and the
-    # gate sat it out from $78,047 to $81,265.
-    #
-    # choch_flip_hours > 0 (backtest only) relaxes that in one narrow case: a
-    # fresh 4H CHoCH counts if the DAILY has itself just flipped the same way
-    # within that window, i.e. this is the opening leg of a new daily trend
-    # rather than another failed bounce inside an old one.
-    kind_ok = bool(event_4h) and event_4h["type"] == "BOS"
-    entry_kind = "bos"
-    if (not kind_ok and choch_flip_hours and event_4h
-            and event_4h["type"] == "CHoCH" and event_1d
-            and event_1d.get("type") == "CHoCH"
-            and event_1d.get("direction") == event_4h["direction"]):
-        try:
-            flip_age = now_utc - datetime.fromisoformat(event_1d["time"])
-            if timedelta(0) <= flip_age <= timedelta(hours=choch_flip_hours):
-                kind_ok = True
-                entry_kind = "choch-flip"
-        except Exception:
-            pass
-
-    direction = None
-    if kind_ok and trend_1d == "up" and event_4h["direction"] == "bullish":
-        direction = "long"
-    elif kind_ok and trend_1d == "down" and event_4h["direction"] == "bearish":
-        direction = "short"
-    gates["trend_aligned_bos"] = direction is not None
-
-    # Fresh means "this is the candle that just closed" — without this the
-    # same break re-fires every hour for days until the next event.
-    fresh = False
-    if direction:
-        try:
-            fresh = (now_utc - datetime.fromisoformat(event_4h["time"])) <= timedelta(hours=4)
-        except Exception:
-            fresh = False
-    gates["fresh"] = fresh
-    gates["news_clear"] = not news_blocked
-
-    if not all(gates.values()):
-        return {"ready": False, "gates": gates, "direction": direction}
-
-    breakout = candles_4h[event_4h["index"]]
-    entry = price
-    long = direction == "long"
-    candle_stop = breakout["low"] if long else breakout["high"]
-    stop = candle_stop
-    if stop_mode == "structure":
-        stop = _structural_stop(candles_4h, event_4h["index"], long, swing_strength, candle_stop)
-
-    # Sanity: the stop must still sit on the correct side of entry. Can fail
-    # if price has already round-tripped past the breakout candle's opposite
-    # extreme by the time this runs.
-    valid_side = (stop < entry) if long else (stop > entry)
-    gates["stop_valid"] = valid_side
-    if not valid_side:
-        return {"ready": False, "gates": gates, "direction": direction}
-
-    cap = MAX_FEE_PCT_OF_RISK if max_fee_pct is None else max_fee_pct
-    fee_pct, risk_pct_used = _continuation_fee(entry, stop)
-    gates["fee_ok"] = fee_pct is not None and fee_pct <= cap
-
-    if not gates["fee_ok"] and stop_mode == "hybrid":
-        wider = _structural_stop(candles_4h, event_4h["index"], long, swing_strength, candle_stop)
-        if wider != stop:
-            stop = wider
-            fee_pct, risk_pct_used = _continuation_fee(entry, stop)
-            gates["fee_ok"] = fee_pct is not None and fee_pct <= cap
-
-    return {
-        "ready": all(gates.values()), "gates": gates, "direction": direction,
-        "entry": entry, "stop": stop, "fee_pct": fee_pct,
-        "risk_pct_used": risk_pct_used,
-        "risk_unusually_high": risk_pct_used > 6.0,
-        "stop_source": "structure" if stop != candle_stop else "candle",
-        "stop_dist_pct": abs(entry - stop) / entry * 100,
-        "entry_kind": entry_kind,
-        "event": event_4h,
-    }
-
-
-# Binance quantity step per symbol (the LOT_SIZE filter). Refreshed from
-# exchangeInfo every run; these values only stand in if that call fails.
-LOT_STEPS = {"BTCUSDT": 0.001, "ETHUSDT": 0.001, "BNBUSDT": 0.01,
-             "SOLUSDT": 0.01, "XRPUSDT": 0.1}   # verified live 2026-10-21
-
-
 async def refresh_lot_steps() -> None:
     try:
         info = await server._get(server.BINANCE_BASE_URL, "/fapi/v1/exchangeInfo",
@@ -1181,184 +428,6 @@ async def refresh_lot_steps() -> None:
                         LOT_STEPS[sym["symbol"]] = float(f["stepSize"])
     except Exception as e:
         log(f"(lot sizes not refreshed, using fallbacks: {e})")
-
-
-def _fmt_qty(qty: float, step: float) -> str:
-    decimals = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
-    return f"{qty:.{decimals}f}"
-
-
-def order_ticket(symbol: str, direction: str, entry: float, stop: float,
-                 raw_qty: float, mode: str) -> str:
-    """The numbers to type into Binance, rounded to the symbol's quantity
-    step. Rounded DOWN so risk never exceeds the plan, unless that would fall
-    under Binance's $100 minimum, in which case up to the minimum - and the
-    risk line shows what that costs."""
-    step = LOT_STEPS.get(symbol, 0.001)
-    qty = math.floor(raw_qty / step + 1e-9) * step
-    if qty * entry < risk.MIN_NOTIONAL_USD:
-        qty = math.ceil(risk.MIN_NOTIONAL_USD / entry / step - 1e-9) * step
-    dist = abs(entry - stop)
-    long = direction == "long"
-    tp = round(entry + 2 * dist if long else entry - 2 * dist, 6)
-    lines = [f"ORDER - {'BUY / LONG' if long else 'SELL / SHORT'} {symbol}",
-             f"Qty {_fmt_qty(qty, step)}  (~${qty * entry:,.0f})",
-             f"Stop-market {stop}"]
-    if mode == "continuation":
-        half = math.floor(qty / 2 / step + 1e-9) * step
-        if half >= step:
-            lines.append(f"Take-profit {tp} on HALF ({_fmt_qty(half, step)}), trail the rest")
-        else:
-            lines.append(f"Take-profit {tp} - qty too small to split, so full TP or trail all")
-    else:
-        lines.append(f"Take-profit {tp} on the FULL qty")
-    lines.append(f"Risk if stopped: ${qty * dist:.2f}")
-    return "\n".join(lines)
-
-
-def format_setup_alert(symbol: str, r: dict, setup: dict, now_utc: datetime) -> str:
-    """The message Chamara actually wants: what triggered, the numbers, and
-    the risk-management levels — not just 'a level moved'."""
-    entry, stop = setup["entry"], setup["stop"]
-    d = setup["direction"].upper()
-    try:
-        m = risk.position_size(entry=entry, stop_loss=stop, capital=CAPITAL,
-                                risk_pct=RISK_PCT, leverage=LEVERAGE)
-    except Exception as e:
-        return f"SETUP READY {symbol} {d} @ {entry} / stop {stop} (math failed: {e})"
-
-    verdict = "PASS" if m["passes_plan"] else "FAIL"
-    warn = ""
-    if m.get("warnings"):
-        warn = "\nWarnings: " + "; ".join(str(w) for w in m["warnings"])
-
-    # 1R from entry — where the stop moves to break even.
-    r_dist = abs(entry - stop)
-    breakeven = round(entry + r_dist, 2) if d == "LONG" else round(entry - r_dist, 2)
-
-    return (
-        f"SETUP READY — {symbol} {d}\n"
-        f"All gates passed ({setup['kill_zone']} kill zone).\n\n"
-        f"{order_ticket(symbol, setup['direction'], entry, stop, m['position']['size_btc'], 'reversal')}\n\n"
-        f"Entry {entry}  |  Stop {stop}  |  Plan check: {verdict}\n"
-        f"Zone {setup['zone']['bottom']}-{setup['zone']['top']}\n"
-        f"Size {m['position']['size_btc']} (${m['position']['notional_usd']}), "
-        f"margin@{LEVERAGE}x ${m['position']['margin_by_leverage_usd'][f'{LEVERAGE}x']}\n"
-        f"Risk ${m['risk_amount_usd']} ({m['inputs']['risk_pct']}%), "
-        f"approx liq {m['approx_liquidation_price']}\n"
-        f"Targets 1:2={m['plan_target_prices']['1:2']}  "
-        f"1:3={m['plan_target_prices']['1:3']}\n"
-        f"Fees ~{m['fees']['pct_of_risk']}% of risk\n\n"
-        f"Manage: breakeven stop at {breakeven} (1R), then take the FULL "
-        f"position off at 1:2. Trailing was re-tested on corrected data over "
-        f"three windows and won only one of them (it is not a money-loser — "
-        f"that older claim was wrong — just not better here), so the fixed "
-        f"1:2 stands. Exit on an opposing 1H CHoCH rather "
-        f"than waiting for the stop.\n"
-        f"1D {r['trend_1d']} / 4H {r['trend_4h']} — aligned.\n"
-        f"{warn}\n"
-        f"Math only, NOT a recommendation. You decide.\n"
-        f"{footer(now_utc)}"
-    )
-
-
-def format_continuation_alert(symbol: str, setup: dict, now_utc: datetime) -> str:
-    """The continuation-mode counterpart to format_setup_alert. No zone to
-    quote — the fresh trend-aligned 4H BOS itself is the trigger — and the
-    risk % actually used can be above the plan's default 2% when the
-    structurally-correct stop is wide enough to fall under Binance's $100
-    minimum at 2% (Chamara's call, 2026-08-29: size to the minimum instead
-    of shrinking the stop or skipping the trade)."""
-    entry, stop = setup["entry"], setup["stop"]
-    d = setup["direction"].upper()
-    risk_pct_used = setup.get("risk_pct_used", RISK_PCT)
-    try:
-        m = risk.position_size(entry=entry, stop_loss=stop, capital=CAPITAL,
-                                risk_pct=risk_pct_used, leverage=LEVERAGE)
-    except Exception as e:
-        return f"CONTINUATION SETUP {symbol} {d} @ {entry} / stop {stop} (math failed: {e})"
-
-    verdict = "PASS" if m["passes_plan"] else "FAIL"
-    warn = ""
-    if m.get("warnings"):
-        warn = "\nWarnings: " + "; ".join(str(w) for w in m["warnings"])
-    risk_note = (
-        f" (above the default {RISK_PCT}% — sized up to clear Binance's "
-        f"${risk.MIN_NOTIONAL_USD:.0f} minimum at this stop width)"
-        if risk_pct_used > RISK_PCT else ""
-    )
-
-    r_dist = abs(entry - stop)
-    breakeven = round(entry + r_dist, 2) if d == "LONG" else round(entry - r_dist, 2)
-    ev = setup.get("event") or {}
-
-    return (
-        f"CONTINUATION SETUP — {symbol} {d}\n"
-        f"Fresh {ev.get('type', 'BOS')} at {ev.get('level')} ({ev.get('time')}), "
-        f"same direction as the 1D trend — entering on the break, no pullback wait.\n\n"
-        f"{order_ticket(symbol, setup['direction'], entry, stop, m['position']['size_btc'], 'continuation')}\n\n"
-        f"Entry {entry}  |  Stop {stop} (breakout candle's own low/high)  |  "
-        f"Plan check: {verdict}\n"
-        f"Size {m['position']['size_btc']} (${m['position']['notional_usd']}), "
-        f"margin@{LEVERAGE}x ${m['position']['margin_by_leverage_usd'][f'{LEVERAGE}x']}\n"
-        f"Risk ${m['risk_amount_usd']} ({risk_pct_used}%){risk_note}, "
-        f"approx liq {m['approx_liquidation_price']}\n"
-        f"Targets 1:2={m['plan_target_prices']['1:2']}  "
-        f"1:3={m['plan_target_prices']['1:3']}\n"
-        f"Fees ~{m['fees']['pct_of_risk']}% of risk\n\n"
-        f"Manage: breakeven stop at {breakeven} (1R), then trail behind each "
-        f"new 4H swing — the default, but NOT unconditional. On corrected "
-        f"out-of-sample data trailing beats a fixed 1:2 overall (+128R vs "
-        f"+49R across two windows) and that edge is almost entirely from "
-        f"TRENDING markets; in chop the fixed 1:2 actually won (+21R vs "
-        f"+13R). So if price has been chopping rather than trending, taking "
-        f"the full position at 1:2 is a reasonable call, not a mistake. "
-        f"Half off at 1:2 if you want something locked in early, rest "
-        f"trailed; or trail the whole position with no fixed TP at all. "
-        f"Decide now, don't wait until it's already in profit.\n"
-        f"{warn}\n"
-        f"Math only, NOT a recommendation. You decide.\n"
-        f"{footer(now_utc)}"
-    )
-
-
-def range_since(candles: list, since_utc, bar_hours: int = 1, after_only: bool = False):
-    """(low, high) across every candle still forming at or after `since_utc`,
-    plus the current forming bar. With no reference point only the forming
-    bar counts. Runs are hourly at :07, so between two runs one bar
-    completes; its wicks are what the close-only check kept missing.
-
-    `after_only` keeps ONLY bars that opened at or after `since_utc`, dropping
-    the bar that straddles it. For a position, that straddling bar is the one
-    the entry happened inside: part of it traded BEFORE the fill, so its low
-    cannot be attributed to the trade. Including it made a hour-1 continuation
-    entry stop itself out by construction — the stop is the forming 4H
-    candle's low, a strict subset of that same 1H bar (measured at 20.2% of
-    all firings). Returns (None, None) when nothing qualifies yet, so the
-    caller falls back to the current price, which is always a true
-    observation. Matches the backtest, which walks from the bar AFTER entry.
-    """
-    if not candles:
-        return None, None
-    chosen = candles[-1:]
-    if since_utc is not None:
-        picked = []
-        for c in candles:
-            try:
-                open_t = datetime.fromisoformat(c["open_time"])
-            except Exception:
-                continue
-            if open_t.tzinfo is None:
-                open_t = open_t.replace(tzinfo=timezone.utc)
-            keep = open_t >= since_utc if after_only else (
-                open_t + timedelta(hours=bar_hours) > since_utc)
-            if keep:
-                picked.append(c)
-        if picked:
-            chosen = picked
-        elif after_only:
-            return None, None
-    return min(c["low"] for c in chosen), max(c["high"] for c in chosen)
 
 
 async def check_symbol(symbol: str, since_utc=None) -> dict:
@@ -1416,25 +485,6 @@ async def check_symbol(symbol: str, since_utc=None) -> dict:
         "recent_high_4h": (struct_4h["swings"]["recent_highs"][0]["price"]
                             if struct_4h["swings"]["recent_highs"] else None),
     }
-
-
-def format_math(label: str, entry: float, stop: float) -> str:
-    try:
-        m = risk.position_size(entry=entry, stop_loss=stop, capital=200,
-                                risk_pct=2, leverage=5)
-        verdict = "PASS" if m["passes_plan"] else "FAIL"
-        return (
-            f"    {label} math (plan check, NOT a recommendation): "
-            f"{m['direction'].upper()} @ {entry} / stop {stop} -> {verdict}; "
-            f"size {m['position']['size_btc']} BTC "
-            f"(${m['position']['notional_usd']}), "
-            f"margin@5x ${m['position']['margin_by_leverage_usd']['5x']}, "
-            f"approx liq {m['approx_liquidation_price']}, "
-            f"targets 1:2={m['plan_target_prices']['1:2']} "
-            f"1:3={m['plan_target_prices']['1:3']}"
-        )
-    except Exception as e:
-        return f"    (math skipped: {e})"
 
 
 async def main() -> None:
@@ -1859,16 +909,18 @@ async def main() -> None:
     ping_healthcheck(ok=not degraded)
 
 
+CLI_USAGE = (
+    "usage:\n"
+    "  standalone_monitor.py                        run the hourly check\n"
+    "  standalone_monitor.py list                   show tracked trades\n"
+    "  standalone_monitor.py add SYM long|short ENTRY STOP [reversal|continuation]\n"
+    "  standalone_monitor.py close SYM\n"
+)
+
+
 def cli(argv) -> int:
     """Manage tracked positions. Kept in this file so the VM has one script
     to deploy, not two that can drift apart."""
-    usage = (
-        "usage:\n"
-        "  standalone_monitor.py                        run the hourly check\n"
-        "  standalone_monitor.py list                   show tracked trades\n"
-        "  standalone_monitor.py add SYM long|short ENTRY STOP [reversal|continuation]\n"
-        "  standalone_monitor.py close SYM\n"
-    )
     if not argv:
         return -1
 
@@ -1956,7 +1008,7 @@ def _cli(argv) -> int:
                  if freed else ""))
         return 0
 
-    print(usage)
+    print(CLI_USAGE)
     return 2
 
 
