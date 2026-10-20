@@ -23,6 +23,9 @@ monitor_state.json
 monitor_log.txt
 latest_alert.txt
 positions.json
+real_trades.json
+bot_state.json
+monitor.lock
 
 # Credentials for the cloud VM - must never be committed
 monitor.env

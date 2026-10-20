@@ -29,3 +29,9 @@ fi
 git reset -q --hard "$target"
 echo "--- now on $(git log --oneline -1) (was ${current:0:7}) ---"
 ./run-monitor.sh
+
+# The Telegram bot is a long-running service, so new code only takes effect
+# once it restarts. Skipped where the service is not installed.
+if systemctl list-unit-files trading-bot.service >/dev/null 2>&1; then
+    sudo systemctl restart trading-bot && echo "--- trading-bot restarted ---"
+fi

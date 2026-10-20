@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Daily snapshot of the runtime files git does not track. paper_trades.json
-# is the one forward record no backtest bug can contaminate, and until now it
-# lived only on this VM's single disk.
+# is the one forward record no backtest bug can contaminate, real_trades.json
+# the only record of what was actually traded, and both live on this VM's
+# single disk.
 #
 #   ./backup.sh          snapshot; also send it to Telegram on Sundays (UTC)
 #   ./backup.sh --send   snapshot and send it to Telegram now
@@ -15,7 +16,7 @@ dest="$HOME/backups"
 mkdir -p "$dest"
 
 files=()
-for f in paper_trades.json positions.json monitor_state.json; do
+for f in paper_trades.json real_trades.json positions.json monitor_state.json; do
     [ -f "$f" ] && files+=("$f")
 done
 archive="$dest/monitor-$(date -u +%Y-%m-%d).tar.gz"

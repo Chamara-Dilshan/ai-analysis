@@ -48,6 +48,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -62,6 +64,10 @@ HERE = Path(__file__).parent
 STATE_PATH = HERE / "monitor_state.json"
 POSITIONS_PATH = HERE / "positions.json"
 PAPER_PATH = HERE / "paper_trades.json"
+# Shared by the hourly run, the CLI and bot.py. Each loads these JSON files,
+# changes them and writes them back; without one lock a /took arriving
+# mid-run would be overwritten by the run's own save a few seconds later.
+LOCK_PATH = HERE / "monitor.lock"
 LOG_PATH = HERE / "monitor_log.txt"
 ALERT_PATH = HERE / "latest_alert.txt"
 
@@ -146,6 +152,50 @@ HEARTBEAT_HOUR_UTC = 6
 # When running headless (CI, VPS cron) there is no console and no Windows
 # toast — echo the log to stdout so the run output is the record instead.
 ECHO_STDOUT = os.environ.get("MONITOR_ECHO_STDOUT") == "1"
+
+
+@contextmanager
+def state_lock(timeout: float = 180.0):
+    """Exclusive lock over the state, journal and positions files. A no-op
+    where fcntl does not exist (Windows dev machines), which only ever run one
+    writer at a time anyway."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    with open(LOCK_PATH, "w") as fh:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"{LOCK_PATH.name} held for over {timeout:.0f}s")
+                time.sleep(0.5)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+# Message kinds that /pause holds back. Everything else - stop hits,
+# breakeven and trail cues, drawdown lines, monitor problems, the heartbeat -
+# still goes out: a paused alert stream must never hide a live position.
+SETUP_ALERT_PREFIXES = ("SETUP READY", "CONTINUATION SETUP", "HEADS UP")
+
+
+def paused_until(state: dict, now_utc: datetime):
+    """The pause end time if alerts are paused right now, else None."""
+    raw = state.get("paused_until")
+    if not raw:
+        return None
+    try:
+        until = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return until if until > now_utc else None
 
 
 def load_state() -> dict:
@@ -651,7 +701,8 @@ def manage_position(pos: dict, r: dict, now_utc: datetime):
             f"STOP HIT — {pos['symbol']} {pos['direction'].upper()}\n"
             f"The bar traded to {adverse}, through your stop {eff_stop} "
             f"(now ${price}).\n"
-            f"{outcome}\nRemoved from tracking.\n{footer(now_utc)}"
+            f"{outcome}\nRemoved from tracking. Log your exit: "
+            f"/closed {pos['symbol']} <price>\n{footer(now_utc)}"
         )
         return msgs
 
@@ -681,7 +732,8 @@ def manage_position(pos: dict, r: dict, now_utc: datetime):
                 f"Price hit {target} this bar (now ${price}, {round(r_mult, 2)}R).\n"
                 f"Reversal trade: take the FULL position off here. The bounce "
                 f"is the trade — trailing reversal setups gave back profit in "
-                f"testing.\nRemoved from tracking.\n{footer(now_utc)}"
+                f"testing.\nRemoved from tracking. Log your exit: "
+                f"/closed {pos['symbol']} <price>\n{footer(now_utc)}"
             )
             return msgs
         msgs.append(
@@ -1422,7 +1474,8 @@ async def main() -> None:
                                        f"({used} open, cap {MAX_OPEN_POSITIONS})")
                 else:
                     trade = record_paper_trade(symbol, setup, now)
-                    telegram_msgs.append(format_setup_alert(symbol, r, setup, now))
+                    telegram_msgs.append(format_setup_alert(symbol, r, setup, now)
+                                         + f"\nTook it? Reply /took {symbol}")
                     paper.append(trade)
                     pending_paper_trades.append(trade)
                     pending_alert_keys.append(
@@ -1481,7 +1534,8 @@ async def main() -> None:
                 else:
                     trade = record_paper_trade(symbol, cont_setup, now,
                                                mode="continuation")
-                    telegram_msgs.append(format_continuation_alert(symbol, cont_setup, now))
+                    telegram_msgs.append(format_continuation_alert(symbol, cont_setup, now)
+                                         + f"\nTook it? Reply /took {symbol}")
                     paper.append(trade)
                     pending_paper_trades.append(trade)
                     pending_alert_keys.append(
@@ -1617,6 +1671,14 @@ async def main() -> None:
     # Structure events and level crossings stay in the log. Only setups,
     # heads-ups and the heartbeat are worth a phone notification — an alert
     # that fires on every wiggle is an alert that gets muted.
+    until = paused_until(state, now)
+    if until:
+        held = [m for m in telegram_msgs if m.startswith(SETUP_ALERT_PREFIXES)]
+        if held:
+            telegram_msgs = [m for m in telegram_msgs if m not in held]
+            log(f"(alerts paused until {until.strftime('%Y-%m-%d %H:%M')} UTC - "
+                f"held back {len(held)} setup alert(s); still journalled)")
+
     sends_ok = True
     for msg in telegram_msgs:
         if not send_telegram(msg):
@@ -1670,6 +1732,11 @@ def cli(argv) -> int:
     if not argv:
         return -1
 
+    with state_lock():
+        return _cli(argv)
+
+
+def _cli(argv) -> int:
     cmd, rest = argv[0], argv[1:]
     positions = load_positions()
     paper = load_paper()
@@ -1757,7 +1824,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         raise SystemExit(cli(sys.argv[1:]))
     try:
-        asyncio.run(main())
+        with state_lock():
+            asyncio.run(main())
     except Exception as e:
         log(f"FATAL: {e}")
         raise
