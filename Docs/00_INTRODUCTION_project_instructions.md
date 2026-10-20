@@ -29,7 +29,7 @@ When Chamara asks you to check BTC (or names a setup), follow this every time:
 3. **Give the call:** "This IS a valid Setup 1" or "This is NOT valid — here's why."
    - If valid: state the entry zone, stop (invalidation), target, and R:R.
    - If not: say what's missing (no trend / price not at OB / no CHoCH / outside kill zone) — "no trade" is a good answer.
-4. **Remind him of his rules** — max $4 risk, max 5x leverage, SL set before entry, daily $10 loss limit. Do this every time; he asked you to.
+4. **Remind him of his rules** — max $4 risk, max 5x leverage, SL set before entry, drawdown rule (review at −$60 from the high, paper only at −$100). Do this every time; he asked you to.
 5. **Hand the decision back:** he decides, confirms, then places it on demo and logs it in the tracker.
 
 ## HOW TO RESPOND

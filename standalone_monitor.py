@@ -81,10 +81,18 @@ SYMBOLS = list(dict.fromkeys(REVERSAL_SYMBOLS + CONTINUATION_SYMBOLS))
 
 # Crypto moves together. The day BTC breaks, the alt continuation gates fire
 # the same direction — five positions at 2% each is 10% of the account at
-# risk at once, double the plan's daily loss limit. Cap concurrent open
+# risk at once. Cap concurrent open
 # setups; anything beyond it is logged, not alerted, so the paper record
 # still shows what the cap cost or saved.
 MAX_OPEN_POSITIONS = 2
+
+# The plan's drawdown rule (Section 7, 2026-10-20), measured on the paper
+# record from its highest point. It replaced daily/weekly/monthly breaks,
+# which a portfolio replay showed cost money without reducing the drop: the
+# system's real risk is a slow bleed of ~$80-90 over months (worst tested
+# drawdowns -$78 to -$91 on $200), which no calendar limit ever sees.
+DRAWDOWN_REVIEW_USD = 60.0
+DRAWDOWN_STOP_USD = 100.0
 SL_OFFSET = timedelta(hours=5, minutes=30)
 
 # The plan's trading windows, UTC. A setup outside these is prep, not a trade.
@@ -519,6 +527,53 @@ def paper_summary(trades: list) -> str:
         f"({money} at each trade's actual sizing). "
         f"{sum(1 for t in trades if t['status'] == 'open')} still open."
     )
+
+
+def paper_drawdown(trades: list) -> tuple:
+    """(equity, drawdown) in USD of the resolved paper record, walked in the
+    order trades closed. Drawdown is <= 0: how far equity sits below its own
+    highest point so far, starting from the journal's $0."""
+    done = sorted((t for t in trades if t.get("status") in ("win", "loss")),
+                  key=lambda t: t.get("closed") or t.get("opened") or "")
+    equity = peak = 0.0
+    for t in done:
+        equity += t.get("r", 0) * CAPITAL * t.get("risk_pct_used", RISK_PCT) / 100
+        peak = max(peak, equity)
+    return equity, equity - peak
+
+
+def drawdown_check(trades: list, prev_level):
+    """(level, message) for the plan's drawdown rule. level is None, "review"
+    or "stop". message is set only when the level gets WORSE than prev_level,
+    so each line is announced once per drawdown. The level clears only after
+    recovering to half the review line — hovering around -$60 must not
+    re-alert every hour."""
+    _, dd = paper_drawdown(trades)
+    rank = {None: 0, "review": 1, "stop": 2}
+    if dd <= -DRAWDOWN_STOP_USD:
+        level = "stop"
+    elif dd <= -DRAWDOWN_REVIEW_USD:
+        level = "review"
+    elif dd > -DRAWDOWN_REVIEW_USD / 2:
+        level = None
+    else:
+        level = prev_level            # between the lines: hold, no flapping
+    if rank[level] <= rank.get(prev_level, 0):
+        return level, None
+    if level == "stop":
+        msg = (f"DRAWDOWN STOP — paper record is ${-dd:.2f} below its high "
+               f"(line: ${DRAWDOWN_STOP_USD:.0f}).\n"
+               "Plan Section 7: stop real-money trades. Paper only until the "
+               "record makes a new high. No backtested period ever fell this "
+               "far, so something has changed — review before going back.\n")
+    else:
+        msg = (f"DRAWDOWN REVIEW — paper record is ${-dd:.2f} below its high "
+               f"(line: ${DRAWDOWN_REVIEW_USD:.0f}).\n"
+               "Plan Section 7: keep going, but check your recent real trades "
+               "against their alerts — same entry, stop and exit? Drops of "
+               "$78-$91 happened in every tested period; this alone is not a "
+               "reason to quit.\n")
+    return level, msg
 
 
 def open_slots(paper: list, positions: list) -> int:
@@ -1502,6 +1557,18 @@ async def main() -> None:
             f"Check: ssh to the VM, then tail -20 ~/trading-analysis/monitor_log.txt\n"
             + footer(now)
         )
+
+    # The plan's drawdown rule, on the forward paper record. Recorded only
+    # once the push lands, like every other "he was told" flag.
+    prev_dd = state.get("drawdown_alert")
+    dd_level, dd_msg = drawdown_check(paper, prev_dd)
+    if dd_msg:
+        telegram_msgs.append(dd_msg + footer(now))
+        pending_alert_keys.append((state, "drawdown_alert", prev_dd))
+    if dd_level is None:
+        state.pop("drawdown_alert", None)
+    else:
+        state["drawdown_alert"] = dd_level
 
     # One heartbeat a day. Without it, a dead monitor and a quiet market look
     # identical from the phone — which is exactly how 19 green-but-empty CI

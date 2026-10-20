@@ -63,9 +63,9 @@ Trading is a business, not gambling. Your biggest asset is **discipline**, not t
 ## SECTION 2 — CAPITAL MANAGEMENT
 With $200, every dollar still matters. One trade without a stop can end everything.
 
-| Per-Trade Risk | Daily Loss Limit | Max Open Trades |
+| Per-Trade Risk | Drawdown Rule | Max Open Trades |
 |---|---|---|
-| **MAX 2% ($4)** | **MAX 5% ($10)** | **MAX 2** |
+| **MAX 2% ($4)** | **Review at −$60 · paper-only at −$100** (see Section 7) | **MAX 2** |
 
 **Position Size Formula**
 ```
@@ -174,9 +174,20 @@ Always go highest → lowest timeframe. Never trade against the Daily trend.
 ---
 
 ## SECTION 7 — EMERGENCY RULES
-- Daily loss > $10 (5%) → stop for the day.
-- Weekly loss > $20 (10%) → 3-day break.
-- Monthly loss > $40 (20%) → 1-week break + full review.
+**Drawdown rule (replaces the old daily $10 / weekly $20 / monthly $40 breaks — 2026-10-20).**
+Drawdown = how far the account sits below its highest point so far.
+- **Down $60 from the high (30%) → REVIEW.** Keep trading, but check every recent trade against its alert: same entry, same stop, same exit? If my trades drifted from the system, fix that first.
+- **Down $100 from the high (50%) → STOP real money.** Paper only until the paper record makes a new high again. No tested period ever fell this far, so reaching it means something is actually broken.
+- The monitor tracks this on the paper record and sends a Telegram at both lines.
+
+**Expect this — it is normal, not failure.** Backtested on three different markets (2021–2026, both setups, max 2 open, fees included):
+- Worst drop from a high: **$78–$91 (about 40–45%)**.
+- Time spent below the last high: **8 to 13 months** at a stretch.
+- Losing streaks of **20+ trades** happened. Win rate is about 29%; the winners are bigger than the losers.
+
+**Why the calendar limits were removed:** tested, they did not protect the account. Taking a 3-day or 1-week break after a bad week/month earned *less* ($374 vs $395) and in one period made the worst drop *bigger* (−$141 vs −$89) — the breaks mostly skipped the winners that come after losses. The real danger is a slow bleed over months, which no daily or weekly limit ever sees.
+
+**What a bad DAY still means:** if I've lost 2 trades in a day and I feel the urge to "win it back", I close the platform. That is a mood rule, not a money rule — and it still matters.
 
 **Revenge-trading warning — STOP the moment you think:**
 - "I need to recover this loss right now" → close the platform
@@ -211,7 +222,8 @@ I, Chamara, commit to:
 - NEVER risk more than 2% on a single trade (Section 2's continuation-only exception is a deliberate, documented, capped carve-out — not a loophole).
 - NEVER use more than 5x leverage.
 - ALWAYS complete my journal after every trade.
-- STOP trading the moment my daily $10 loss limit is hit.
+- Sit through normal drawdowns (up to ~$90 has happened in testing) without quitting or changing the rules mid-drop.
+- REVIEW at −$60 from my high; STOP real money at −$100 and go back to paper.
 - NEVER enter out of FOMO, impatience, or emotion.
 - Treat every loss as a lesson — never a reason for revenge.
 - Use my coach to **pressure-test my own analysis** — and make my own decisions.

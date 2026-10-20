@@ -47,7 +47,7 @@ The coach checks your thinking. **You** make every decision.
 1. ALWAYS set Stop Loss before entry.
 2. NEVER risk more than 2% per trade ($4).
 3. NEVER use more than 5x leverage.
-4. Daily loss limit = $10 → STOP trading for the day.
+4. Drawdown rule: −$60 from the high → review; −$100 → paper only. Drops of ~$90 are normal for this system.
 5. NO trade without 3 confluence factors.
 6. Kill Zones only: London 07–09 UTC / NY 13–15 UTC.
 7. NO trading 30 min before/after high-impact news.
