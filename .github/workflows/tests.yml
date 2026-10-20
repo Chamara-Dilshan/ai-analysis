@@ -1,0 +1,26 @@
+name: tests
+
+# Every push runs the full suite. The tests mock Binance with respx, so the
+# HTTP 451 geo-block that rules out the hourly monitor here does not apply.
+# update.sh on the VM runs the same suite again before it lets a commit go
+# live; this run is the early warning, that one is the gate.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements-dev.txt
+
+      - run: python -m pytest -q
