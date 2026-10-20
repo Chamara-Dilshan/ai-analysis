@@ -7,6 +7,7 @@ monitor.env; every other sender is ignored.
     /took SYM [ENTRY]           log the alerted setup on SYM as a real trade
     /took SYM long|short ENTRY STOP [reversal|continuation]   log any trade
     /closed SYM PRICE           log your exit; use the average if you scaled out
+    /scorecard                  the weekly scorecard, on demand
     /pause [HOURS]              hold back setup alerts (default 24h)
     /resume                     turn setup alerts back on
     /help
@@ -25,9 +26,9 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+import scorecard
 import standalone_monitor as mon
 
-REAL_PATH = mon.HERE / "real_trades.json"
 BOT_STATE_PATH = mon.HERE / "bot_state.json"
 STALE_RUN = timedelta(hours=2)      # cron runs hourly; two missed is a problem
 
@@ -38,6 +39,7 @@ HELP = (
     "/took ETH 2531.5 - same, at your actual fill price\n"
     "/took ETH short 2531.5 2576.4 - log a trade with no alert\n"
     "/closed ETH 2463 - log your exit (average price if you scaled out)\n"
+    "/scorecard - the weekly scorecard, now\n"
     "/pause 12 - hold back setup alerts for 12h (default 24h)\n"
     "/resume - setup alerts back on\n\n"
     "Stop, breakeven, trail and drawdown messages are never paused."
@@ -46,6 +48,7 @@ HELP = (
 COMMANDS = [("status", "Monitor health, open trades, records"),
             ("took", "Log a trade you took: /took ETH [fill price]"),
             ("closed", "Log your exit: /closed ETH 2463"),
+            ("scorecard", "Live record vs backtests, fills, skipped alerts"),
             ("pause", "Hold back setup alerts: /pause [hours]"),
             ("resume", "Turn setup alerts back on"),
             ("help", "List commands")]
@@ -54,19 +57,6 @@ COMMANDS = [("status", "Monitor health, open trades, records"),
 # --------------------------------------------------------------------------- #
 # the real-trade journal
 # --------------------------------------------------------------------------- #
-def load_real() -> list:
-    if REAL_PATH.exists():
-        try:
-            return json.loads(REAL_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return []
-
-
-def save_real(trades: list) -> None:
-    REAL_PATH.write_text(json.dumps(trades, indent=2), encoding="utf-8")
-
-
 def real_summary(trades: list) -> str:
     done = [t for t in trades if t.get("status") in ("win", "loss")]
     open_n = sum(1 for t in trades if t.get("status") == "open")
@@ -128,7 +118,7 @@ def cmd_status(now: datetime) -> str:
     out.append(f"Setup alerts: PAUSED until {until.strftime('%m-%d %H:%M')} UTC."
                if until else "Setup alerts: on.")
 
-    real = load_real()
+    real = mon.load_real()
     open_real = [t for t in real if t.get("status") == "open"]
     tracked = {p["symbol"]: p for p in mon.load_positions() if not p.get("closed")}
     if open_real:
@@ -193,7 +183,7 @@ def cmd_took(args: list, now: datetime) -> str:
         return (f"Entry {entry} is on the wrong side of the stop {stop} for a "
                 f"{direction} - price has already passed the stop. Not logged.")
 
-    real = load_real()
+    real = mon.load_real()
     if any(t["symbol"] == sym and t.get("status") == "open" for t in real):
         return f"You already have an open {sym} trade logged. Close it first: /closed {sym.replace('USDT', '')} PRICE"
     positions = mon.load_positions()
@@ -208,7 +198,7 @@ def cmd_took(args: list, now: datetime) -> str:
                  "risk_pct": risk_pct, "source": source, "opened": opened,
                  "status": "open"})
     mon.save_positions(positions)
-    save_real(real)
+    mon.save_real(real)
 
     slip = ""
     if alert_entry is not None and entry != alert_entry:
@@ -227,7 +217,7 @@ def cmd_closed(args: list, now: datetime) -> str:
     if len(args) != 2:
         return "Usage: /closed ETH 2463  (your exit price; the average if you scaled out)"
     sym, exit_price = symbol_of(args[0]), price_of(args[1])
-    real = load_real()
+    real = mon.load_real()
     opens = [t for t in real if t["symbol"] == sym and t.get("status") == "open"]
     if not opens:
         others = ", ".join(t["symbol"] for t in real if t.get("status") == "open") or "none"
@@ -243,7 +233,7 @@ def cmd_closed(args: list, now: datetime) -> str:
 
     positions = mon.load_positions()
     mon.save_positions([p for p in positions if p["symbol"] != sym])
-    save_real(real)
+    mon.save_real(real)
 
     money = f"{'+' if usd >= 0 else '-'}${abs(usd):.2f}"
     return (f"Closed: {sym} {t['direction'].upper()} {t['entry']} -> {exit_price} = "
@@ -290,6 +280,10 @@ def handle(text: str, now: datetime = None) -> str:
                 return cmd_took(args, now)
             if cmd == "closed":
                 return cmd_closed(args, now)
+            if cmd == "scorecard":
+                paper = mon.load_paper()
+                return scorecard.weekly_scorecard(paper, mon.load_real(),
+                                                  mon.paper_drawdown(paper)[1], now)
             if cmd == "pause":
                 return cmd_pause(args, now)
             if cmd == "resume":

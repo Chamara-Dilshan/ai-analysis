@@ -45,6 +45,7 @@ never assume it worked — check monitor_log.txt).
 """
 import asyncio
 import json
+import math
 import os
 import subprocess
 import sys
@@ -59,11 +60,14 @@ import server
 import structure
 import risk
 import news
+import scorecard
 
 HERE = Path(__file__).parent
 STATE_PATH = HERE / "monitor_state.json"
 POSITIONS_PATH = HERE / "positions.json"
 PAPER_PATH = HERE / "paper_trades.json"
+# Trades actually taken, logged through bot.py (/took, /closed).
+REAL_PATH = HERE / "real_trades.json"
 # Shared by the hourly run, the CLI and bot.py. Each loads these JSON files,
 # changes them and writes them back; without one lock a /took arriving
 # mid-run would be overwritten by the run's own save a few seconds later.
@@ -406,6 +410,19 @@ def load_paper() -> list:
 
 def save_paper(trades: list) -> None:
     PAPER_PATH.write_text(json.dumps(trades, indent=2), encoding="utf-8")
+
+
+def load_real() -> list:
+    if REAL_PATH.exists():
+        try:
+            return json.loads(REAL_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def save_real(trades: list) -> None:
+    REAL_PATH.write_text(json.dumps(trades, indent=2), encoding="utf-8")
 
 
 def record_paper_trade(symbol: str, setup: dict, now_utc: datetime,
@@ -822,6 +839,16 @@ async def check_news_blackout(now_utc: datetime):
         return False, f"news check unavailable ({type(e).__name__})"
 
 
+def running_version() -> str:
+    """Short commit id and subject of the deployed code, for the heartbeat."""
+    try:
+        out = subprocess.run(["git", "log", "-1", "--format=%h %s"], cwd=HERE,
+                             capture_output=True, text=True, timeout=10)
+        return out.stdout.strip() or "unknown version"
+    except Exception:
+        return "unknown version"
+
+
 def ping_healthcheck(ok: bool = True) -> None:
     """Check in with an external dead-man's switch, if one is configured.
 
@@ -1106,6 +1133,58 @@ def evaluate_trend_continuation_setup(trend_1d: str, event_4h: dict, candles_4h:
     }
 
 
+# Binance quantity step per symbol (the LOT_SIZE filter). Refreshed from
+# exchangeInfo every run; these values only stand in if that call fails.
+LOT_STEPS = {"BTCUSDT": 0.001, "ETHUSDT": 0.001, "BNBUSDT": 0.01,
+             "SOLUSDT": 1.0, "XRPUSDT": 0.1}
+
+
+async def refresh_lot_steps() -> None:
+    try:
+        info = await server._get(server.BINANCE_BASE_URL, "/fapi/v1/exchangeInfo",
+                                 cache_ttl=3600)
+        for sym in info.get("symbols", []):
+            if sym.get("symbol") in SYMBOLS:
+                for f in sym.get("filters", []):
+                    if f.get("filterType") == "LOT_SIZE":
+                        LOT_STEPS[sym["symbol"]] = float(f["stepSize"])
+    except Exception as e:
+        log(f"(lot sizes not refreshed, using fallbacks: {e})")
+
+
+def _fmt_qty(qty: float, step: float) -> str:
+    decimals = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
+    return f"{qty:.{decimals}f}"
+
+
+def order_ticket(symbol: str, direction: str, entry: float, stop: float,
+                 raw_qty: float, mode: str) -> str:
+    """The numbers to type into Binance, rounded to the symbol's quantity
+    step. Rounded DOWN so risk never exceeds the plan, unless that would fall
+    under Binance's $100 minimum, in which case up to the minimum - and the
+    risk line shows what that costs."""
+    step = LOT_STEPS.get(symbol, 0.001)
+    qty = math.floor(raw_qty / step + 1e-9) * step
+    if qty * entry < risk.MIN_NOTIONAL_USD:
+        qty = math.ceil(risk.MIN_NOTIONAL_USD / entry / step - 1e-9) * step
+    dist = abs(entry - stop)
+    long = direction == "long"
+    tp = round(entry + 2 * dist if long else entry - 2 * dist, 6)
+    lines = [f"ORDER - {'BUY / LONG' if long else 'SELL / SHORT'} {symbol}",
+             f"Qty {_fmt_qty(qty, step)}  (~${qty * entry:,.0f})",
+             f"Stop-market {stop}"]
+    if mode == "continuation":
+        half = math.floor(qty / 2 / step + 1e-9) * step
+        if half >= step:
+            lines.append(f"Take-profit {tp} on HALF ({_fmt_qty(half, step)}), trail the rest")
+        else:
+            lines.append(f"Take-profit {tp} - qty too small to split, so full TP or trail all")
+    else:
+        lines.append(f"Take-profit {tp} on the FULL qty")
+    lines.append(f"Risk if stopped: ${qty * dist:.2f}")
+    return "\n".join(lines)
+
+
 def format_setup_alert(symbol: str, r: dict, setup: dict, now_utc: datetime) -> str:
     """The message Chamara actually wants: what triggered, the numbers, and
     the risk-management levels — not just 'a level moved'."""
@@ -1129,6 +1208,7 @@ def format_setup_alert(symbol: str, r: dict, setup: dict, now_utc: datetime) -> 
     return (
         f"SETUP READY — {symbol} {d}\n"
         f"All gates passed ({setup['kill_zone']} kill zone).\n\n"
+        f"{order_ticket(symbol, setup['direction'], entry, stop, m['position']['size_btc'], 'reversal')}\n\n"
         f"Entry {entry}  |  Stop {stop}  |  Plan check: {verdict}\n"
         f"Zone {setup['zone']['bottom']}-{setup['zone']['top']}\n"
         f"Size {m['position']['size_btc']} (${m['position']['notional_usd']}), "
@@ -1185,6 +1265,7 @@ def format_continuation_alert(symbol: str, setup: dict, now_utc: datetime) -> st
         f"CONTINUATION SETUP — {symbol} {d}\n"
         f"Fresh {ev.get('type', 'BOS')} at {ev.get('level')} ({ev.get('time')}), "
         f"same direction as the 1D trend — entering on the break, no pullback wait.\n\n"
+        f"{order_ticket(symbol, setup['direction'], entry, stop, m['position']['size_btc'], 'continuation')}\n\n"
         f"Entry {entry}  |  Stop {stop} (breakout candle's own low/high)  |  "
         f"Plan check: {verdict}\n"
         f"Size {m['position']['size_btc']} (${m['position']['notional_usd']}), "
@@ -1348,6 +1429,7 @@ async def main() -> None:
     pending_paper_trades = []
     positions = load_positions()
     paper = load_paper()
+    await refresh_lot_steps()
 
     # Checked once per run, not per symbol — the calendar is market-wide.
     news_blocked, news_note = await check_news_blackout(now)
@@ -1624,6 +1706,20 @@ async def main() -> None:
     else:
         state["drawdown_alert"] = dd_level
 
+    # The weekly scorecard: the live record against what the backtests say
+    # is normal for that many trades. Sundays, with the heartbeat.
+    week = now.date().isoformat()
+    if (now.weekday() == 6 and now.hour == HEARTBEAT_HOUR_UTC
+            and state.get("last_scorecard") != week):
+        try:
+            _, dd_now = paper_drawdown(paper)
+            telegram_msgs.append(scorecard.weekly_scorecard(paper, load_real(), dd_now, now)
+                                 + "\n" + footer(now))
+            pending_alert_keys.append((state, "last_scorecard", state.get("last_scorecard")))
+            state["last_scorecard"] = week
+        except Exception as e:
+            log(f"(scorecard failed: {e!r})")
+
     # One heartbeat a day. Without it, a dead monitor and a quiet market look
     # identical from the phone — which is exactly how 19 green-but-empty CI
     # runs went unnoticed.
@@ -1640,6 +1736,7 @@ async def main() -> None:
             + "\n".join(summary)
             + f"\n\n{news_note}."
             + "\nNo setup alert today means no setup, not a failure.\n"
+            + f"Running {running_version()}.\n"
             + footer(now)
         )
         # Stamped only if the push lands. Marking the day done on a failed

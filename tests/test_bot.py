@@ -22,9 +22,9 @@ def files(tmp_path, monkeypatch):
                         ("POSITIONS_PATH", "positions.json"),
                         ("PAPER_PATH", "paper_trades.json"),
                         ("LOG_PATH", "monitor_log.txt"),
-                        ("LOCK_PATH", "monitor.lock")):
+                        ("LOCK_PATH", "monitor.lock"),
+                        ("REAL_PATH", "real_trades.json")):
         monkeypatch.setattr(m, name, tmp_path / fname)
-    monkeypatch.setattr(bot, "REAL_PATH", tmp_path / "real_trades.json")
 
     def write(name, data):
         (tmp_path / name).write_text(json.dumps(data))
