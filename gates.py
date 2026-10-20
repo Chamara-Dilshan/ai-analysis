@@ -278,6 +278,13 @@ def evaluate_trend_continuation_setup(trend_1d: str, event_4h: dict, candles_4h:
             fee_pct, risk_pct_used = _continuation_fee(entry, stop)
             gates["fee_ok"] = fee_pct is not None and fee_pct <= cap
 
+    # "2% strict" (2026-10-21): a stop too wide for 2% risk to reach Binance's
+    # $100 minimum is skipped, not sized up. Pre-registered and passed on the
+    # never-used 2019-09 -> 2021-01 window (+$179 vs +$176, max drawdown -$54
+    # vs -$57) after winning 2 of 3 earlier windows; Docs/05. Narrow on profit,
+    # clear on risk: no trade ever risks more than the plan's 2%.
+    gates["risk_ok"] = risk_pct_used <= RISK_PCT
+
     return {
         "ready": all(gates.values()), "gates": gates, "direction": direction,
         "entry": entry, "stop": stop, "fee_pct": fee_pct,

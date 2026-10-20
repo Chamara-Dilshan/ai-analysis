@@ -476,19 +476,29 @@ def test_continuation_stays_at_default_risk_when_stop_is_tight():
     assert setup["risk_pct_used"] == m.RISK_PCT
 
 
-def test_continuation_bumps_risk_pct_when_stop_is_wide():
+def test_continuation_skips_a_stop_too_wide_for_two_percent():
     # A much wider breakout candle (low far below entry, like the real
     # 2026-08-19 BTC candle) pushes 2%-of-$200 below Binance's $100 minimum.
-    # Chamara's call (2026-08-29): size to the minimum instead of skipping —
-    # bump risk_pct rather than reject the trade.
+    # Until 2026-10-21 the gate sized up to clear it (the 2026-08-29 call);
+    # "2% strict" passed its pre-registered test on the never-used 2019-2020
+    # window (Docs/05), so the setup is now skipped. The risk it WOULD have
+    # needed is still reported, so the log says why.
     event, now = _cont_event(direction="bullish")
     candles = _cont_candles(breakout_low=70000.0)
     setup = m.evaluate_trend_continuation_setup("up", event, candles, 74400.0, now)
-    assert setup["ready"], setup["gates"]
+    assert not setup["ready"]
+    assert setup["gates"]["risk_ok"] is False
+    assert all(v for k, v in setup["gates"].items() if k != "risk_ok")
     stop_dist_pct = (74400.0 - 70000.0) / 74400.0 * 100
     expected = round(risk.MIN_NOTIONAL_USD * stop_dist_pct / m.CAPITAL, 3)
-    assert setup["risk_pct_used"] == expected
-    assert setup["risk_pct_used"] > m.RISK_PCT
+    assert setup["risk_pct_used"] == expected > m.RISK_PCT
+
+
+def test_continuation_within_two_percent_still_fires():
+    event, now = _cont_event(direction="bullish")
+    setup = m.evaluate_trend_continuation_setup("up", event, _cont_candles(), 74400.0, now)
+    assert setup["ready"] and setup["gates"]["risk_ok"] is True
+    assert setup["risk_pct_used"] == m.RISK_PCT
 
 
 def test_continuation_rejects_when_breakout_candle_no_longer_validates_the_stop():

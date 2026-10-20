@@ -42,4 +42,25 @@ If it passes: adopt 2% strict in the live monitor. If it fails on either:
 reject, keep live sizing, and do not re-test this idea on any window.
 
 ## Result
-_To be filled in after the run, without editing anything above this line._
+Run 2026-10-21 on 2019-09-01 → 2021-01-01 (318 raw trades; SOL listed Sep 2020, BNB/XRP early 2020).
+
+| | live (size up) | 2% strict |
+|---|---|---|
+| trades taken | 229 | 215 |
+| total R | +46.8R | +44.7R |
+| **USD** | **+$176** | **+$179** |
+| **max drawdown** | **−$57** | **−$54** |
+| worst day / week / month | −$13 / −$20 / −$38 | −$9 / −$20 / −$36 |
+| days losing > $10 | 1 | 0 |
+
+1. More USD: +$179 > +$176 — **pass** (by $3).
+2. Drawdown no more than $10 worse: −$54 vs −$57, i.e. $3 *better* — **pass**.
+
+**PASSED. Adopted** in the live continuation gate as `risk_ok`, in the same commit as this result.
+
+Honest reading: on profit this is a tie — $3 over 15 months is noise. What it
+really buys is risk control: no trade above the plan's 2%, a smaller worst
+drop, and fewer bad days, without costing money in 3 of 4 periods tested.
+That, plus the rule having been set in advance, is why it is adopted rather
+than argued about. The 2019–2020 window is now used; it cannot be the
+untouched test for any future idea.

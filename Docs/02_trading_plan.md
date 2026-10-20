@@ -76,7 +76,7 @@ At 3x leverage: margin ≈ $400 / 3 ≈ $133
 
 **⚠️ Account-size warning:** On $200 this formula can still produce positions below Binance's minimum — **0.001 BTC _and_ $100 notional**, whichever is larger (an exchange rule — it does not scale with your capital) — OR force you to break your risk rule to meet it. If the math doesn't fit cleanly — **skip the trade.** Don't force size. (The `calculate_position_size` tool flags this automatically.)
 
-**Narrow exception — continuation trades only (2026-08-29):** a continuation entry's stop sits at the breakout candle's own low/high, which can be wide enough that 2% risk alone falls under Binance's $100 minimum. Rather than shrink that stop to an arbitrary, unstructural distance just to hit 2%, or skip a real setup over it, size to whatever risk % clears the $100 floor instead — reported plainly in the alert, not silently forced to 2%. This is still capped in spirit: if the math ever implies something well past ~5–6%, that is flagged as unusual, not auto-taken. This exception applies ONLY to continuation entries — reversal entries keep their tight, zone-based stop and the flat 2% cap, no exception needed.
+**No exceptions to 2% (since 2026-10-21).** Continuation trades used to be sized UP when their breakout-candle stop was too wide for 2% to reach Binance's $100 minimum (the 2026-08-29 exception). That was tested against simply skipping those setups — pre-registered, on 2019–2020 data never used before (Docs/05) — and skipping won: +$179 vs +$176, worst drop −$54 vs −$57, and it had already won 2 of 3 earlier periods. So now every trade, reversal or continuation, risks at most 2%. A stop wider than about 4% of price means the setup is skipped, and the monitor logs it as `risk_ok` failing.
 
 **Leverage by condition**
 - Strong trend + clean setup → max 5x
@@ -219,7 +219,7 @@ Complete one for EVERY trade. No exceptions. Your journal is your most valuable 
 ## SECTION 10 — CHAMARA'S COMMITMENT
 I, Chamara, commit to:
 - ALWAYS set a Stop Loss before entering — no exceptions.
-- NEVER risk more than 2% on a single trade (Section 2's continuation-only exception is a deliberate, documented, capped carve-out — not a loophole).
+- NEVER risk more than 2% on a single trade. No exceptions — setups that would need more are skipped.
 - NEVER use more than 5x leverage.
 - ALWAYS complete my journal after every trade.
 - Sit through normal drawdowns (up to ~$90 has happened in testing) without quitting or changing the rules mid-drop.
