@@ -1136,7 +1136,7 @@ def evaluate_trend_continuation_setup(trend_1d: str, event_4h: dict, candles_4h:
 # Binance quantity step per symbol (the LOT_SIZE filter). Refreshed from
 # exchangeInfo every run; these values only stand in if that call fails.
 LOT_STEPS = {"BTCUSDT": 0.001, "ETHUSDT": 0.001, "BNBUSDT": 0.01,
-             "SOLUSDT": 1.0, "XRPUSDT": 0.1}
+             "SOLUSDT": 0.01, "XRPUSDT": 0.1}   # verified live 2026-10-21
 
 
 async def refresh_lot_steps() -> None:

@@ -116,10 +116,16 @@ def test_ticket_rounds_down_to_the_lot_step():
 
 
 def test_ticket_rounds_up_only_to_clear_the_100_dollar_minimum():
-    # SOL steps in whole coins: 0.9 SOL ($94) cannot be placed, 1 SOL can.
+    # 0.9 SOL is $94 - under Binance's minimum - so it rounds UP to the
+    # smallest step-aligned qty that clears $100, and says what that risks.
     t = m.order_ticket("SOLUSDT", "long", 104.3, 100.2, 0.9, "continuation")
-    assert "Qty 1 " in t
-    assert "qty too small to split" in t
+    assert "Qty 0.96 " in t and "Risk if stopped: $3.94" in t
+
+
+def test_a_qty_of_one_step_cannot_be_split(monkeypatch):
+    monkeypatch.setitem(m.LOT_STEPS, "SOLUSDT", 1.0)
+    t = m.order_ticket("SOLUSDT", "long", 104.3, 100.2, 0.9, "continuation")
+    assert "Qty 1 " in t and "qty too small to split" in t
 
 
 def test_continuation_ticket_halves_the_take_profit():
