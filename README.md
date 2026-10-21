@@ -35,7 +35,7 @@ silent production bugs fixed with tests that fail on the old code. **→ [Read t
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TB
     B[Binance futures API] --> S[server.py<br/>fetch + retry + cache]
     S --> ST[structure.py<br/>swings, BOS/CHoCH, FVG, order blocks]
     ST --> G[gates.py<br/>reversal + continuation]
