@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 
 import httpx
 import pytest
-import respx
 from fastmcp import Client
 
 import server

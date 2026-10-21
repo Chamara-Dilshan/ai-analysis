@@ -6,7 +6,7 @@ without shrinking the drop — the system's real risk is a slow bleed over
 months that no calendar limit sees.
 """
 import standalone_monitor as m
-from test_capped_dedup import NOW, _run
+from test_capped_dedup import _run
 
 
 def _closed(r, day, risk=2.0):

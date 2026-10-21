@@ -2,7 +2,6 @@
 The weekly scorecard (scorecard.py), the order ticket on setup alerts, and the
 running version in the heartbeat.
 """
-import json
 from datetime import datetime, timedelta, timezone
 
 import pytest

@@ -184,7 +184,7 @@ def state_lock(timeout: float = 180.0):
                 break
             except BlockingIOError:
                 if time.monotonic() > deadline:
-                    raise TimeoutError(f"{LOCK_PATH.name} held for over {timeout:.0f}s")
+                    raise TimeoutError(f"{LOCK_PATH.name} held for over {timeout:.0f}s") from None
                 time.sleep(0.5)
         try:
             yield

@@ -116,7 +116,7 @@ def load_candles(path: str) -> tuple[list[dict], dict]:
         try:
             header = next(reader)
         except StopIteration:
-            raise ParseError("file is empty")
+            raise ParseError("file is empty") from None
 
         columns: dict[str, int] = {}
         for index, name in enumerate(header):

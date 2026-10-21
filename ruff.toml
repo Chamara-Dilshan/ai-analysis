@@ -1,0 +1,8 @@
+# Lint for real defects, not style: syntax/import errors, undefined names and
+# unused code (F), likely bugs (B), and the statement-level E rules.
+target-version = "py312"
+
+[lint]
+select = ["E4", "E7", "E9", "F", "B"]
+# `l` / `h` for a candle's low and high read naturally in this codebase.
+ignore = ["E741"]

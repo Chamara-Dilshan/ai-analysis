@@ -12,7 +12,7 @@ Deliberately NOT attempted: automatic Elliott Wave counting (reliable
 auto-counting isn't feasible). The swing points below are what a human would
 hand-count waves from.
 """
-from typing import Any, Optional
+from typing import Optional
 
 Candle = dict
 

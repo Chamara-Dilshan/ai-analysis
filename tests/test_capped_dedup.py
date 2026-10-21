@@ -17,7 +17,6 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 
-import pytest
 
 import standalone_monitor as m
 

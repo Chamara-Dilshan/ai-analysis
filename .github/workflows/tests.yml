@@ -23,4 +23,8 @@ jobs:
 
       - run: pip install -r requirements-dev.txt
 
-      - run: python -m pytest -q
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Tests with coverage
+        run: python -m pytest -q --cov=. --cov-report=term
