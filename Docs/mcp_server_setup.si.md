@@ -1,0 +1,182 @@
+# Binance BTC Futures MCP Server
+
+Chamara ගේ trading assistant එකට live BTCUSDT Perpetual futures data + market
+sentiment/overview දෙන local MCP server එක. Claude Desktop app එකේ **stdio**
+transport හරහා run වෙනවා — public hosting/API key කිසිවක් අවශ්‍ය නෑ (Binance,
+alternative.me, CoinGecko market data endpoints ඔක්කොම public).
+
+## 🛠️ Tools මොනවද තියෙන්නේ
+
+| Tool | මොකද කරන්නේ | Source |
+|---|---|---|
+| `get_btc_price` | Current price, 24h high/low/change/volume | Binance |
+| `get_funding_rate` | Funding rate + bullish/bearish interpretation | Binance |
+| `get_klines` | OHLCV candles — timeframe ඕනෑම එකක් (1m ... 1M) | Binance |
+| `get_order_book` | Bid/ask depth — liquidity pools/thin zones බලන්න | Binance |
+| `get_open_interest` | Open interest (current + history) — positioning build/unwind බලන්න | Binance |
+| `get_long_short_ratio` | Top traders vs retail crowd long/short ratio — divergence signal | Binance |
+| `get_taker_volume` | Taker buy/sell volume ratio — aggressive order flow | Binance |
+| `get_market_structure` | ICT/SMC structure — swings, BOS/CHoCH, FVG, order blocks, liquidity, premium/discount (dealing-range based), ATR | Binance (computed) |
+| `get_top_down` | Daily + 4H + 1H structure in one call — the plan's top-down framework | Binance (computed) |
+| `get_fear_greed_index` | Crypto Fear & Greed Index (0-100) + classification | alternative.me |
+| `get_market_overview` | Total market cap, BTC dominance, top N altcoins | CoinGecko |
+| `calculate_position_size` | Plan-compliant sizing + risk checks (2% risk, 5x lev, 1:2 R:R, Binance min, liquidation, fees) — pass/fail verdict | Local (plan math) |
+| `get_session_clock` | Current UTC time + London/NY kill-zone status for entry timing | Local (clock) |
+| `get_economic_calendar` | High-impact news blackout check (FOMC/CPI/NFP…) — "no trade 30 min around news" | ForexFactory (faireconomy.media) |
+
+alternative.me, CoinGecko, සහ ForexFactory calendar feed (faireconomy.media)
+ඔක්කොම **free, no API key** — Binance වගේම public data endpoints. (Calendar
+feed එක **unofficial mirror** එකක් — schedule එක verify කරගන්න.)
+
+`get_market_structure` extra API call එකක් නෑ — klines වලින්ම (`structure.py`)
+locally compute කරනවා. මේවා **heuristic** ICT/SMC rules; validated signals නෙවෙයි,
+සහ Elliott Wave auto-count කරන්නේ නෑ (swings වලින් manual count කරන්න).
+premium/discount දැන් **current dealing range** එක (last swing low → last swing
+high) පාවිච්චි කරනවා පරණ whole-window range එකට වඩා — ICT definition එකට
+ගැලපෙන්න. ATR එකත් (volatility yardstick, stop distance sanity-check කරන්න)
+එකතු වුනා. `get_top_down` එකෙන් Daily+4H+1H තුනම එකවර ලබාගන්න පුළුවන්.
+
+`calculate_position_size` (`risk.py`) සහ `get_session_clock` දෙකම **network එකක්
+නෑ** — pure local. Sizing tool එක trading plan එකේ rules (2% risk, 5x leverage,
+1:2 R:R, Binance min order 0.001 BTC / $100 notional) encode කරලා, trade එකකට
+කලින්ම pass/fail verdict එකක් දෙනවා. Math විතරයි — signal/advice නෙවෙයි, decision
+එක Chamara ගේ.
+
+## 📦 Setup (One-Time)
+
+### 1. Python environment එක හදන්න
+
+```bash
+cd binance-mcp
+python3 -m venv venv
+source venv/bin/activate      # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 2. Server එක standalone test කරන්න (optional)
+
+```bash
+python server.py
+```
+Ctrl+C එකෙන් නවත්තන්න — මේක ok run වුනොත් setup එක හරි.
+
+### 3. Claude Desktop config එකට එකතු කරන්න
+
+Config file එකේ location:
+- **Mac**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+
+File එක නැත්නම් අලුතෙන් හදන්න. තියෙනවා නම් `mcpServers` object එකට මේක
+එකතු කරන්න (path එක ඔයාගේ actual absolute path එකට වෙනස් කරන්න):
+
+```json
+{
+  "mcpServers": {
+    "binance-btc-futures": {
+      "command": "/absolute/path/to/binance-mcp/venv/bin/python",
+      "args": ["/absolute/path/to/binance-mcp/server.py"]
+    }
+  }
+}
+```
+
+⚠️ **වැදගත්**: `command` එකේ path එක venv **තුළ** තියෙන python executable
+එකට යොමු කරන්න (`which python` venv activate කරලා run කරලා check කරන්න)
+— system python එකට යොමු කළොත් `fastmcp`/`httpx` `ModuleNotFoundError` වේවි.
+
+### 4. Claude Desktop restart කරන්න
+
+සම්පූර්ණයෙන්ම quit කරලා (menu bar/tray icon එකෙනුත්) reopen කරන්න.
+Settings → Connectors වල `binance-btc-futures` connected ලෙස පේනවා නම් OK.
+
+## ✅ Test කරන්නේ මෙහෙම
+
+Claude Desktop එකේ අලුත් chat එකක් අරන් අහන්න:
+
+> "BTCUSDT price, funding rate, open interest සහ long/short ratio එක්ක Fear &
+> Greed index එකයි market overview එකයි check කරලා දෙන්න"
+
+Claude ට අදාළ tools call කරලා live data එකතු කරගන්න පුළුවන් වෙයි.
+
+## 🧪 Automated tests (dev)
+
+`server.py` එක වෙනස් කලාට පස්සේ, මේකෙන් හැම tool එකම + retry/cache logic එක
+verify කරගන්න පුළුවන් (network එක ඕනෑ නෑ — APIs mock කරනවා):
+
+```bash
+python -m pip install -r requirements-dev.txt   # one-time
+python -m pytest -q
+```
+Tests ඔක්කොම pass වුනොත් `server.py` එක healthy.
+
+## 🔄 Live copy එක sync කරන්නේ මෙහෙම
+
+**වැදගත්**: Claude Desktop run කරන්නේ මේ source folder එකෙන් නෙවෙයි — වෙනම
+folder එකකින් (`C:\Users\chama\mcp-servers\binance-btc-futures`). මේ source
+එකේ (D:) වෙනසක් කළාට Desktop එකට automatic ලෙස පේන්නේ නෑ; restart කරන එකෙන්
+විතරක් වැඩක් වෙන්නෙත් නෑ — copy කරන්නත් ඕන.
+
+`server.py`/`risk.py`/`news.py`/`structure.py` වලින් එකක් හරි වෙනස් කළාට පස්සේ,
+මේ command එක run කරන්න (root එකේ ඉඳන්):
+
+```bash
+sync-to-live.cmd
+```
+
+මේකෙන්: වෙනස් වුන files ටික live folder එකට copy කරලා (පරණ `server.py` →
+`server.py.bak` ලෙස backup කරලා), live venv එකේම `pytest` run කරලා ok ද කියලා
+check කරනවා. **Tests fail උනොත් Desktop restart කරන්න එපා** — first ඒක fix
+කරන්න. Tests pass උනොත් විතරක් Desktop එක fully quit කරලා reopen කරන්න.
+
+## 🖥️ Standalone hourly monitor (Claude session එකෙන් independent)
+
+Chat session එක close කළත් (Claude Desktop පිටවුනත්) hourly BTC/ETH level check
+එක run වෙන්න ඕන නම්, `standalone_monitor.py` — Windows Task Scheduler එකෙන්
+hourly run වෙන, MCP/Claude එකක් හම්බ නොවෙන, fully independent script එකක්:
+
+- **Engine එකම reuse කරනවා**: `server._get`/`_fetch_klines` (retry/cache),
+  `structure.analyze` (ICT/SMC), `risk.position_size` (plan math) — logic
+  duplicate කරන්නේ නෑ, chat monitor එකේ underlying code එකම.
+- ⚠️ **වැදගත් වෙනසක්**: level-picking එක මෙතන **mechanical rule** එකක් —
+  price එකට ළඟම open bullish OB/FVG = support, recent 4H swing high/low
+  ම = bull/bear-confirm. Chat එකේදී මම දෙන judgment-based read එකට වඩා සරලයි —
+  first-pass screener එකක් විදිහට හිතන්න, alert එකක් ආවම full read එකක් chat
+  එකෙන්ම අහන්න.
+- **Output**: `monitor_log.txt` (හැම run එකකම එකතු වෙනවා — reliable source),
+  `latest_alert.txt` (trigger එකක් ආවොත් විතරක්), `monitor_state.json`
+  (internal — "already alerted" duplicate-alert වළක්වන්න).
+- **Notification**: native Windows toast එකක් try කරනවා (extra pip dependency
+  නෑ — PowerShell/WinRT හරහා) — **best-effort විතරයි**, OS notification
+  settings අනුව පේන්නත් පුළුවන් නොපේන්නත් පුළුවන්. `monitor_log.txt` එකයි
+  සැබෑ source of truth.
+
+**Task එක manage කරන්නේ මෙහෙම** (PowerShell):
+```powershell
+Get-ScheduledTaskInfo -TaskName "BTC-ETH-LevelMonitor"   # last run, next run, result
+Disable-ScheduledTask -TaskName "BTC-ETH-LevelMonitor"   # pause
+Enable-ScheduledTask -TaskName "BTC-ETH-LevelMonitor"    # resume
+Unregister-ScheduledTask -TaskName "BTC-ETH-LevelMonitor" -Confirm:$false  # remove entirely
+```
+
+## 🔧 Troubleshooting
+
+| ගැටළුව | හේතුව / විසඳුම |
+|---|---|
+| Connector එක connect වෙන්නෙ නෑ | Config JSON syntax වැරදිද බලන්න (comma, bracket) |
+| `ModuleNotFoundError` | `command` path එක venv python එකට යොමු වෙනවද බලන්න |
+| Tool call fails: "Network error" | Internet connection / firewall Binance domain block කරනවද |
+| Tool call fails: "API error 451" | ඔයාගේ region එකේ Binance restricted විය හැක — VPN එකක් අවශ්‍ය විය හැක |
+| Tool call fails: "API error 429" | Rate-limited — auto-retry ඇතත් heavy use නම් ටිකක් ඉඳලා try කරන්න (CoinGecko free tier) |
+
+## 📌 Note
+
+- Market data (price/funding/klines/order book/OI/long-short/taker/sentiment/
+  market cap) විතරයි — trading execute කරන්නේ නෑ. Account access, order
+  placement, කිසිත් නෑ. Read-only.
+- Reliability: හැම API call එකකම 429/5xx errors + network blips වලට auto-retry
+  (exponential backoff, `Retry-After` respect) තියෙනවා, සහ slow-changing
+  endpoints කෙටි කාලෙකට cache වෙනවා — CoinGecko rate-limit අඩු කරන්න.
+- Rate limits: Binance public API සහ CoinGecko free tier දෙකම IP-based
+  (heavy use කලොත් 429 errors එන්න පුළුවන්, ඒත් retry logic එකෙන් handle
+  වෙනවා) — trading routine එකට (දිනකට analysis 2-3ක්) කිසිම ප්‍රශ්නයක් නෑ.

@@ -1,182 +1,137 @@
-# Binance BTC Futures MCP Server
+# Crypto Futures Setup Monitor
 
-Chamara ගේ trading assistant එකට live BTCUSDT Perpetual futures data + market
-sentiment/overview දෙන local MCP server එක. Claude Desktop app එකේ **stdio**
-transport හරහා run වෙනවා — public hosting/API key කිසිවක් අවශ්‍ය නෑ (Binance,
-alternative.me, CoinGecko market data endpoints ඔක්කොම public).
+[![tests](https://github.com/Chamara-Dilshan/ai-analysis/actions/workflows/tests.yml/badge.svg)](https://github.com/Chamara-Dilshan/ai-analysis/actions/workflows/tests.yml)
 
-## 🛠️ Tools මොනවද තියෙන්නේ
+A trading assistant for Binance USDT-M perpetual futures. It runs 24/7 on a cloud VM: every hour it reads market
+structure on five coins, sends an alert to Telegram when a complete, rule-based setup appears, manages any trade
+you take, and keeps an honest forward record that is checked every week against what the backtests predicted.
 
-| Tool | මොකද කරන්නේ | Source |
-|---|---|---|
-| `get_btc_price` | Current price, 24h high/low/change/volume | Binance |
-| `get_funding_rate` | Funding rate + bullish/bearish interpretation | Binance |
-| `get_klines` | OHLCV candles — timeframe ඕනෑම එකක් (1m ... 1M) | Binance |
-| `get_order_book` | Bid/ask depth — liquidity pools/thin zones බලන්න | Binance |
-| `get_open_interest` | Open interest (current + history) — positioning build/unwind බලන්න | Binance |
-| `get_long_short_ratio` | Top traders vs retail crowd long/short ratio — divergence signal | Binance |
-| `get_taker_volume` | Taker buy/sell volume ratio — aggressive order flow | Binance |
-| `get_market_structure` | ICT/SMC structure — swings, BOS/CHoCH, FVG, order blocks, liquidity, premium/discount (dealing-range based), ATR | Binance (computed) |
-| `get_top_down` | Daily + 4H + 1H structure in one call — the plan's top-down framework | Binance (computed) |
-| `get_fear_greed_index` | Crypto Fear & Greed Index (0-100) + classification | alternative.me |
-| `get_market_overview` | Total market cap, BTC dominance, top N altcoins | CoinGecko |
-| `calculate_position_size` | Plan-compliant sizing + risk checks (2% risk, 5x lev, 1:2 R:R, Binance min, liquidation, fees) — pass/fail verdict | Local (plan math) |
-| `get_session_clock` | Current UTC time + London/NY kill-zone status for entry timing | Local (clock) |
-| `get_economic_calendar` | High-impact news blackout check (FOMC/CPI/NFP…) — "no trade 30 min around news" | ForexFactory (faireconomy.media) |
+The interesting part is not the strategy. It's the method: a backtester rebuilt after finding a look-ahead bug,
+ten strategy ideas tested out of sample and rejected, a rule fixed *before* the data was looked at, and fifteen
+silent production bugs fixed with tests that fail on the old code. **→ [Read the case study](Docs/CASE_STUDY.md)**
 
-alternative.me, CoinGecko, සහ ForexFactory calendar feed (faireconomy.media)
-ඔක්කොම **free, no API key** — Binance වගේම public data endpoints. (Calendar
-feed එක **unofficial mirror** එකක් — schedule එක verify කරගන්න.)
+> **Not financial advice.** This is a personal research and engineering project. It does not place orders, and
+> nothing here is a recommendation to trade. Futures trading with leverage can lose more than you expect.
 
-`get_market_structure` extra API call එකක් නෑ — klines වලින්ම (`structure.py`)
-locally compute කරනවා. මේවා **heuristic** ICT/SMC rules; validated signals නෙවෙයි,
-සහ Elliott Wave auto-count කරන්නේ නෑ (swings වලින් manual count කරන්න).
-premium/discount දැන් **current dealing range** එක (last swing low → last swing
-high) පාවිච්චි කරනවා පරණ whole-window range එකට වඩා — ICT definition එකට
-ගැලපෙන්න. ATR එකත් (volatility yardstick, stop distance sanity-check කරන්න)
-එකතු වුනා. `get_top_down` එකෙන් Daily+4H+1H තුනම එකවර ලබාගන්න පුළුවන්.
+![Weekly dashboard: paper record inside the backtest range, drawdown against review and stop lines](Docs/images/dashboard.png)
 
-`calculate_position_size` (`risk.py`) සහ `get_session_clock` දෙකම **network එකක්
-නෑ** — pure local. Sizing tool එක trading plan එකේ rules (2% risk, 5x leverage,
-1:2 R:R, Binance min order 0.001 BTC / $100 notional) encode කරලා, trade එකකට
-කලින්ම pass/fail verdict එකක් දෙනවා. Math විතරයි — signal/advice නෙවෙයි, decision
-එක Chamara ගේ.
+## What it does
 
-## 📦 Setup (One-Time)
+- **Two setup gates, every hour, on BTC, ETH, SOL, BNB and XRP.**
+  *Reversal*: a pullback into a 4H demand/supply zone, triggered by a 1H break, inside the London or New York session.
+  *Continuation*: a fresh 4H break of structure in the direction of the daily trend.
+  Both also check news blackouts, fees as a share of the risk, and that the trade fits within 2% risk.
+- **Alerts with a copy-ready order**: quantity rounded to Binance's lot size, stop, take-profit and dollar risk.
+- **Trade management**: hourly messages to move the stop to breakeven, trail it behind new 4H swings, or exit on
+  an opposing signal.
+- **Two journals**: a *paper* record of every setup the system fires (taken or not), and a *real* record of the
+  trades actually taken, logged from Telegram.
+- **A weekly scorecard** that compares the live record with the 5–95% range of every run of the same number of
+  consecutive backtest trades, plus a stop rule that was decided in advance.
+- **A Telegram bot**: `/status`, `/took`, `/closed`, `/pause`, `/scorecard`, `/dashboard`.
+- **An MCP server** with 14 market-data and analysis tools for Claude Desktop (structure, funding, open interest,
+  order book, position sizing, session clock, economic calendar).
 
-### 1. Python environment එක හදන්න
+## Architecture
 
-```bash
-cd binance-mcp
-python3 -m venv venv
-source venv/bin/activate      # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+```mermaid
+flowchart LR
+    B[Binance futures API] --> S[server.py<br/>fetch + retry + cache]
+    S --> ST[structure.py<br/>swings, BOS/CHoCH, FVG, order blocks]
+    ST --> G[gates.py<br/>reversal + continuation]
+    N[news.py<br/>economic calendar] --> G
+    G --> M[standalone_monitor.py<br/>hourly run, state, locking]
+    M --> J[journal.py<br/>paper trades, drawdown,<br/>position management]
+    M --> A[alerts.py<br/>alert + order block]
+    A --> T[Telegram]
+    T <--> BOT[bot.py<br/>/took /closed /status ...]
+    BOT --> J
+    J --> SC[scorecard.py + dashboard.py]
+    SC --> T
+    S --> MCP[MCP tools for Claude Desktop]
 ```
 
-### 2. Server එක standalone test කරන්න (optional)
-
-```bash
-python server.py
-```
-Ctrl+C එකෙන් නවත්තන්න — මේක ok run වුනොත් setup එක හරි.
-
-### 3. Claude Desktop config එකට එකතු කරන්න
-
-Config file එකේ location:
-- **Mac**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-- **Linux**: `~/.config/Claude/claude_desktop_config.json`
-
-File එක නැත්නම් අලුතෙන් හදන්න. තියෙනවා නම් `mcpServers` object එකට මේක
-එකතු කරන්න (path එක ඔයාගේ actual absolute path එකට වෙනස් කරන්න):
-
-```json
-{
-  "mcpServers": {
-    "binance-btc-futures": {
-      "command": "/absolute/path/to/binance-mcp/venv/bin/python",
-      "args": ["/absolute/path/to/binance-mcp/server.py"]
-    }
-  }
-}
-```
-
-⚠️ **වැදගත්**: `command` එකේ path එක venv **තුළ** තියෙන python executable
-එකට යොමු කරන්න (`which python` venv activate කරලා run කරලා check කරන්න)
-— system python එකට යොමු කළොත් `fastmcp`/`httpx` `ModuleNotFoundError` වේවි.
-
-### 4. Claude Desktop restart කරන්න
-
-සම්පූර්ණයෙන්ම quit කරලා (menu bar/tray icon එකෙනුත්) reopen කරන්න.
-Settings → Connectors වල `binance-btc-futures` connected ලෙස පේනවා නම් OK.
-
-## ✅ Test කරන්නේ මෙහෙම
-
-Claude Desktop එකේ අලුත් chat එකක් අරන් අහන්න:
-
-> "BTCUSDT price, funding rate, open interest සහ long/short ratio එක්ක Fear &
-> Greed index එකයි market overview එකයි check කරලා දෙන්න"
-
-Claude ට අදාළ tools call කරලා live data එකතු කරගන්න පුළුවන් වෙයි.
-
-## 🧪 Automated tests (dev)
-
-`server.py` එක වෙනස් කලාට පස්සේ, මේකෙන් හැම tool එකම + retry/cache logic එක
-verify කරගන්න පුළුවන් (network එක ඕනෑ නෑ — APIs mock කරනවා):
-
-```bash
-python -m pip install -r requirements-dev.txt   # one-time
-python -m pytest -q
-```
-Tests ඔක්කොම pass වුනොත් `server.py` එක healthy.
-
-## 🔄 Live copy එක sync කරන්නේ මෙහෙම
-
-**වැදගත්**: Claude Desktop run කරන්නේ මේ source folder එකෙන් නෙවෙයි — වෙනම
-folder එකකින් (`C:\Users\chama\mcp-servers\binance-btc-futures`). මේ source
-එකේ (D:) වෙනසක් කළාට Desktop එකට automatic ලෙස පේන්නේ නෑ; restart කරන එකෙන්
-විතරක් වැඩක් වෙන්නෙත් නෑ — copy කරන්නත් ඕන.
-
-`server.py`/`risk.py`/`news.py`/`structure.py` වලින් එකක් හරි වෙනස් කළාට පස්සේ,
-මේ command එක run කරන්න (root එකේ ඉඳන්):
-
-```bash
-sync-to-live.cmd
-```
-
-මේකෙන්: වෙනස් වුන files ටික live folder එකට copy කරලා (පරණ `server.py` →
-`server.py.bak` ලෙස backup කරලා), live venv එකේම `pytest` run කරලා ok ද කියලා
-check කරනවා. **Tests fail උනොත් Desktop restart කරන්න එපා** — first ඒක fix
-කරන්න. Tests pass උනොත් විතරක් Desktop එක fully quit කරලා reopen කරන්න.
-
-## 🖥️ Standalone hourly monitor (Claude session එකෙන් independent)
-
-Chat session එක close කළත් (Claude Desktop පිටවුනත්) hourly BTC/ETH level check
-එක run වෙන්න ඕන නම්, `standalone_monitor.py` — Windows Task Scheduler එකෙන්
-hourly run වෙන, MCP/Claude එකක් හම්බ නොවෙන, fully independent script එකක්:
-
-- **Engine එකම reuse කරනවා**: `server._get`/`_fetch_klines` (retry/cache),
-  `structure.analyze` (ICT/SMC), `risk.position_size` (plan math) — logic
-  duplicate කරන්නේ නෑ, chat monitor එකේ underlying code එකම.
-- ⚠️ **වැදගත් වෙනසක්**: level-picking එක මෙතන **mechanical rule** එකක් —
-  price එකට ළඟම open bullish OB/FVG = support, recent 4H swing high/low
-  ම = bull/bear-confirm. Chat එකේදී මම දෙන judgment-based read එකට වඩා සරලයි —
-  first-pass screener එකක් විදිහට හිතන්න, alert එකක් ආවම full read එකක් chat
-  එකෙන්ම අහන්න.
-- **Output**: `monitor_log.txt` (හැම run එකකම එකතු වෙනවා — reliable source),
-  `latest_alert.txt` (trigger එකක් ආවොත් විතරක්), `monitor_state.json`
-  (internal — "already alerted" duplicate-alert වළක්වන්න).
-- **Notification**: native Windows toast එකක් try කරනවා (extra pip dependency
-  නෑ — PowerShell/WinRT හරහා) — **best-effort විතරයි**, OS notification
-  settings අනුව පේන්නත් පුළුවන් නොපේන්නත් පුළුවන්. `monitor_log.txt` එකයි
-  සැබෑ source of truth.
-
-**Task එක manage කරන්නේ මෙහෙම** (PowerShell):
-```powershell
-Get-ScheduledTaskInfo -TaskName "BTC-ETH-LevelMonitor"   # last run, next run, result
-Disable-ScheduledTask -TaskName "BTC-ETH-LevelMonitor"   # pause
-Enable-ScheduledTask -TaskName "BTC-ETH-LevelMonitor"    # resume
-Unregister-ScheduledTask -TaskName "BTC-ETH-LevelMonitor" -Confirm:$false  # remove entirely
-```
-
-## 🔧 Troubleshooting
-
-| ගැටළුව | හේතුව / විසඳුම |
+| Runs where | What |
 |---|---|
-| Connector එක connect වෙන්නෙ නෑ | Config JSON syntax වැරදිද බලන්න (comma, bracket) |
-| `ModuleNotFoundError` | `command` path එක venv python එකට යොමු වෙනවද බලන්න |
-| Tool call fails: "Network error" | Internet connection / firewall Binance domain block කරනවද |
-| Tool call fails: "API error 451" | ඔයාගේ region එකේ Binance restricted විය හැක — VPN එකක් අවශ්‍ය විය හැක |
-| Tool call fails: "API error 429" | Rate-limited — auto-retry ඇතත් heavy use නම් ටිකක් ඉඳලා try කරන්න (CoinGecko free tier) |
+| Oracle Cloud VM (Mumbai) | `cron` hourly monitor, `systemd` Telegram bot, daily backups |
+| GitHub Actions | lint + 280 tests on every push |
+| `update.sh` on the VM | tests the new commit in a throwaway worktree and only deploys it if every test passes |
 
-## 📌 Note
+Why Mumbai: Binance refuses US IP addresses (HTTP 451), and GitHub's runners are in the US. The tests mock
+Binance, so CI still works; the monitor itself cannot run there.
 
-- Market data (price/funding/klines/order book/OI/long-short/taker/sentiment/
-  market cap) විතරයි — trading execute කරන්නේ නෑ. Account access, order
-  placement, කිසිත් නෑ. Read-only.
-- Reliability: හැම API call එකකම 429/5xx errors + network blips වලට auto-retry
-  (exponential backoff, `Retry-After` respect) තියෙනවා, සහ slow-changing
-  endpoints කෙටි කාලෙකට cache වෙනවා — CoinGecko rate-limit අඩු කරන්න.
-- Rate limits: Binance public API සහ CoinGecko free tier දෙකම IP-based
-  (heavy use කලොත් 429 errors එන්න පුළුවන්, ඒත් retry logic එකෙන් handle
-  වෙනවා) — trading routine එකට (දිනකට analysis 2-3ක්) කිසිම ප්‍රශ්නයක් නෑ.
+## Results, honestly
+
+Backtests replay the live rules hour by hour, rebuilding each 4H/1D candle from the 1H bars printed *so far* (no
+look-ahead), then run a portfolio replay with at most 2 open trades on $200, fees included, slippage not.
+
+| Period | Market | Trades | Total | On $200 | Worst drop |
+|---|---|---|---|---|---|
+| 2019-09 → 2021-01 | untouched until the final test | 215 | +44.7R | +$179 | −$54 |
+| 2021-01 → 2023-01 | trending | 366 | +93.9R | +$376 | −$79 |
+| 2023-01 → 2025-02 | choppy | 402 | +43.8R | +$175 | −$87 |
+| 2025-02 → 2026-10 | recent | 338 | +6.4R | +$26 | −$77 |
+
+What that means:
+- The edge is **small** (about +0.13R per trade) and depends on the market: trend-following earns in trends, the
+  reversal gate earns in chop, and the most recent period is close to break-even.
+- **A 40% drawdown that lasts many months is normal** for this system, with a 29% win rate and losing streaks of
+  20+. The risk rules were rewritten around that ([trading plan](Docs/02_trading_plan.md), Section 7) after
+  testing showed daily/weekly loss limits did not reduce it.
+- **Forward record** (live paper journal, since August 2026): 18 trades, −7.0R, inside the backtest range of
+  −9.5R to +15.0R for 18 trades. Too few to judge; the stop rule applies from 50.
+
+## Example alert
+
+```
+SETUP READY — ETHUSDT SHORT
+All gates passed (London kill zone).
+
+ORDER - SELL / SHORT ETHUSDT
+Qty 0.052  (~$136)
+Stop-market 2692.46
+Take-profit 2463.98 on the FULL qty
+Risk if stopped: $3.96
+
+Manage: breakeven stop at 2540.14 (1R), then take the FULL position off at 1:2 ...
+Took it? Reply /took ETHUSDT
+```
+
+## Project layout
+
+| File | Role |
+|---|---|
+| `server.py` | Binance/CoinGecko/alternative.me client and the MCP server's tools |
+| `structure.py` | ICT/SMC market structure from candles, pure Python |
+| `risk.py` | Position sizing, Binance minimums, fees, liquidation estimate |
+| `news.py` | High-impact economic calendar for news blackouts |
+| `zones.py`, `gates.py` | Zone picking and the two setup gates |
+| `alerts.py` | Alert text and the order block |
+| `journal.py` | Paper trades, the drawdown rule, position management |
+| `standalone_monitor.py` | The hourly run: state, file locking, Telegram, CLI |
+| `bot.py` | The Telegram command bot (long-polling service) |
+| `scorecard.py`, `dashboard.py` | Weekly scorecard and the HTML dashboard |
+| `backtest.py` | Walk-forward replay of the live gates on Binance history |
+| `update.sh`, `backup.sh`, `run-*.sh`, `trading-bot.service` | Deploy, backup and service scripts for the VM |
+| `Docs/` | Trading plan, the pre-registered test, the case study |
+
+## Running it
+
+```bash
+python -m venv venv && venv/bin/pip install -r requirements-dev.txt
+venv/bin/python -m pytest -q          # 280 tests, Binance mocked
+venv/bin/ruff check .
+venv/bin/python backtest.py --mode continuation --exit trailing --start 2023-01-01 --end 2025-02-01
+venv/bin/python standalone_monitor.py # one hourly check (needs Binance access from a non-US IP)
+```
+
+Telegram alerts need `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `monitor.env` (gitignored; `set-token.sh`
+stores the token without echoing it). The MCP server setup for Claude Desktop is in
+[Docs/mcp_server_setup.si.md](Docs/mcp_server_setup.si.md) (Sinhala).
+
+**Stack:** Python 3.12, httpx, FastMCP, pytest + respx, ruff, GitHub Actions, Oracle Cloud (Ubuntu, cron, systemd),
+Telegram Bot API.
+
+## License
+
+[MIT](LICENSE)
