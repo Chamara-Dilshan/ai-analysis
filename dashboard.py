@@ -140,9 +140,10 @@ def _gate_rows(paper):
     return "".join(rows)
 
 
-def _recent_rows(paper, real, limit=15):
+def _recent_rows(paper, real, limit=15, public=False):
     taken = {(t["symbol"], t.get("alert_entry")) for t in real}
-    items = [("Paper", t, "taken" if (t["symbol"], t["entry"]) in taken else "skipped")
+    items = [("Paper", t, "" if public else
+              ("taken" if (t["symbol"], t["entry"]) in taken else "skipped"))
              for t in _closed_sorted(paper)]
     items += [("Real", t, t.get("source", "")) for t in _closed_sorted(real)]
     items.sort(key=lambda it: it[1].get("closed", ""), reverse=True)
@@ -157,8 +158,28 @@ def _recent_rows(paper, real, limit=15):
     return "".join(rows) or "<tr><td colspan='7'>No closed trades yet.</td></tr>"
 
 
+REPO_URL = "https://github.com/Chamara-Dilshan/ai-analysis"
+
+PUBLIC_INTRO = (
+    '<p class="note" style="margin-top:10px">The live forward record of an automated crypto '
+    'futures setup monitor: every setup it has fired since August 2026, scored as paper trades '
+    '(fees included) against the range its backtests predicted for that many trades. Rebuilt '
+    'daily by the monitor itself. <a href="' + REPO_URL + '">Source and case study</a>.</p>')
+
+PUBLIC_FOOTER = (
+    '<p class="note" style="margin-top:18px">Not financial advice. This is a research and '
+    'engineering project; it places no orders and recommends no trades. Paper results assume '
+    'fills at the alert price with fees and no slippage. '
+    '<a href="' + REPO_URL + '">github.com/Chamara-Dilshan/ai-analysis</a></p>')
+
+
 def build_dashboard(paper: list, real: list, now: datetime, version: str = "",
-                    sequences: list = None) -> str:
+                    sequences: list = None, public: bool = False) -> str:
+    """The private dashboard (sent to Telegram) shows both journals. With
+    public=True it is the page published on the web: the paper record only.
+    Real trades, their fills and which alerts were taken never appear."""
+    if public:
+        real = []
     sequences = sequences if sequences is not None else scorecard.load_reference()
     p_done, r_done = _closed_sorted(paper), _closed_sorted(real)
     paper_cum = _cum([t.get("r", 0) for t in p_done])
@@ -190,19 +211,28 @@ def build_dashboard(paper: list, real: list, now: datetime, version: str = "",
         "dd": {"x": [dd_scale.x(i + 1) for i in range(len(dd))], "dd": dd},
     }
 
+    real_tile = "" if public else (
+        f'<div class="tile"><div class="k">You (real)</div><div class="v">{r_total:+.2f}R</div>'
+        f'<div class="d">{len(r_done)} trades · {"+" if r_usd >= 0 else "-"}${abs(r_usd):.2f} '
+        f'before fees</div></div>')
+    real_legend = "" if public else (
+        '<span><b style="background:var(--series-2)"></b>Real (trades you took)</span>')
+
     return TEMPLATE.format(
+        heading="Crypto setup monitor: live record" if public else "Trading dashboard",
+        intro=PUBLIC_INTRO if public else "",
+        footer=PUBLIC_FOOTER if public else "",
+        real_tile=real_tile, real_legend=real_legend,
         generated=now.strftime("%Y-%m-%d %H:%M UTC"),
         version=html.escape(version or "unknown version"),
         p_n=n, p_wins=f"{100 * wins / n:.0f}%" if n else "-",
         p_r=f"{total:+.1f}R",
-        r_n=len(r_done), r_r=f"{r_total:+.2f}R",
-        r_usd=f"{'+' if r_usd >= 0 else '-'}${abs(r_usd):.2f}",
         dd=f"${-dd_now:.2f}", dd_pct=f"{min(100, -dd_now):.0f}",
         verdict=html.escape(verdict),
         band=(f"{band[0]:+.1f}R to {band[2]:+.1f}R" if band else "n/a"),
         eq_svg=eq_svg, dd_svg=dd_svg, W=W, H=H,
         gate_rows=_gate_rows(paper) or "<tr><td colspan='5'>No closed trades yet.</td></tr>",
-        recent_rows=_recent_rows(paper, real),
+        recent_rows=_recent_rows(paper, real, public=public),
         data=json.dumps(hover),
     )
 
@@ -275,14 +305,13 @@ th {{ color: var(--text-secondary); font-weight: 600; font-size: 12px; }}
 .scroll {{ overflow-x: auto; }}
 </style></head>
 <body><main>
-<h1>Trading dashboard</h1>
+<h1>{heading}</h1>
 <p class="sub">Generated {generated} · {version}</p>
-
+{intro}
 <div class="tiles">
   <div class="tile"><div class="k">System (paper)</div><div class="v">{p_r}</div>
     <div class="d">{p_n} trades · {p_wins} wins</div></div>
-  <div class="tile"><div class="k">You (real)</div><div class="v">{r_r}</div>
-    <div class="d">{r_n} trades · {r_usd} before fees</div></div>
+  {real_tile}
   <div class="tile"><div class="k">Drawdown</div><div class="v">{dd}</div>
     <div class="meter"><span style="width:{dd_pct}%"></span><i style="left:60%"></i><i style="left:calc(100% - 2px)"></i></div>
     <div class="d">review at $60 · stop at $100</div></div>
@@ -296,7 +325,7 @@ th {{ color: var(--text-secondary); font-weight: 600; font-size: 12px; }}
   <svg viewBox="0 0 {W} {H}" role="img" aria-label="Cumulative R, paper and real, against the backtest range">{eq_svg}
     <line class="cross" y1="14" y2="{H}" x1="-10" x2="-10"/></svg>
   <div class="legend"><span><b style="background:var(--series-1)"></b>Paper (every alert)</span>
-    <span><b style="background:var(--series-2)"></b>Real (trades you took)</span>
+    {real_legend}
     <span><b style="background:var(--cone);height:8px"></b>Backtest 5–95%</span></div>
   <div class="tip"></div></div>
 
@@ -313,6 +342,7 @@ th {{ color: var(--text-secondary); font-weight: 600; font-size: 12px; }}
 <div class="card"><h2>Latest trades</h2><div class="scroll"><table>
   <tr><th>Closed</th><th>Record</th><th>Coin</th><th>Gate</th><th>Side</th><th class="num">Result</th><th></th></tr>
   {recent_rows}</table></div></div>
+{footer}
 </main>
 <script>
 const D = {data};

@@ -298,6 +298,17 @@ def dashboard_file(now_utc: datetime) -> tuple:
     return f"dashboard-{now_utc.strftime('%Y-%m-%d')}.html", html_text.encode("utf-8")
 
 
+def write_public_dashboard(path) -> None:
+    """The page publish-dashboard.sh puts on the web: the paper record only.
+    real_trades.json is never read here, so nothing about the trades actually
+    taken can leak into it."""
+    with state_lock():
+        paper = load_paper()
+    html_text = dashboard.build_dashboard(paper, [], datetime.now(timezone.utc),
+                                          running_version(), public=True)
+    Path(path).write_text(html_text, encoding="utf-8")
+
+
 def show_toast(title: str, message: str) -> None:
     """Best-effort native Windows toast, no extra pip dependency. Never let a
     notification failure affect the monitor — monitor_log.txt is the source

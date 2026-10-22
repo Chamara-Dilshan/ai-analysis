@@ -60,3 +60,41 @@ def test_the_sunday_run_sends_the_dashboard_with_the_scorecard(monkeypatch, tmp_
     files.clear()
     _run(monkeypatch, tmp_path, state={}, paper=[], mode="quiet", now=NOW - timedelta(days=1))
     assert files == []
+
+
+# --------------------------------------------------------------------------- #
+# the public page (GitHub Pages) must never show real trades
+# --------------------------------------------------------------------------- #
+_REAL = [{"symbol": "ETHUSDT", "direction": "short", "mode": "reversal", "entry": 2610.0,
+          "alert_entry": 2600, "stop": 2692.46, "risk_pct": 2, "status": "win",
+          "r": 1.9, "usd": 7.6, "closed": "2026-10-08T16:07:00+00:00", "source": "alert"}]
+
+
+def test_public_page_leaves_out_every_trace_of_real_trades():
+    page = dashboard.build_dashboard(_paper([2.0, -1.0]), _REAL, NOW, "v",
+                                     sequences=[[1, -1] * 10], public=True)
+    for leak in ("You (real)", "Real (trades you took)", "taken", "skipped", "+1.90R", "Real</td>"):
+        assert leak not in page, leak
+    data = json.loads(page.split("const D = ")[1].split(";\n")[0])
+    assert data["eq"]["real"] == []
+    assert "Not financial advice" in page and dashboard.REPO_URL in page
+
+
+def test_private_page_still_shows_both_records():
+    page = dashboard.build_dashboard(_paper([2.0, -1.0]), _REAL, NOW, "v",
+                                     sequences=[[1, -1] * 10])
+    assert "You (real)" in page and "Real (trades you took)" in page
+    assert "Not financial advice" not in page
+
+
+def test_write_public_dashboard_never_reads_the_real_journal(monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "PAPER_PATH", tmp_path / "paper_trades.json")
+    monkeypatch.setattr(m, "LOCK_PATH", tmp_path / "monitor.lock")
+    (tmp_path / "paper_trades.json").write_text(json.dumps(_paper([2.0])))
+
+    def _boom():
+        raise AssertionError("the public page read real_trades.json")
+    monkeypatch.setattr(m, "load_real", _boom)
+    out = tmp_path / "index.html"
+    m.write_public_dashboard(out)
+    assert "live record" in out.read_text(encoding="utf-8")
