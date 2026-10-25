@@ -13,7 +13,9 @@ silent production bugs fixed with tests that fail on the old code. **→ [Read t
 > **Not financial advice.** This is a personal research and engineering project. It does not place orders, and
 > nothing here is a recommendation to trade. Futures trading with leverage can lose more than you expect.
 
-![Weekly dashboard: paper record inside the backtest range, drawdown against review and stop lines](Docs/images/dashboard.png)
+**📈 [Live dashboard](https://chamara-dilshan.github.io/ai-analysis-dashboard/)**: the forward record, rebuilt every day by the monitor itself.
+
+[![Weekly dashboard: paper record inside the backtest range, drawdown against review and stop lines](Docs/images/dashboard.png)](https://chamara-dilshan.github.io/ai-analysis-dashboard/)
 
 ## What it does
 
@@ -53,7 +55,7 @@ flowchart TB
 
 | Runs where | What |
 |---|---|
-| Oracle Cloud VM (Mumbai) | `cron` hourly monitor, `systemd` Telegram bot, daily backups |
+| Oracle Cloud VM (Mumbai) | `cron` hourly monitor, `systemd` Telegram bot, daily backups, daily public dashboard |
 | GitHub Actions | lint + 280 tests on every push |
 | `update.sh` on the VM | tests the new commit in a throwaway worktree and only deploys it if every test passes |
 
@@ -112,7 +114,7 @@ Took it? Reply /took ETHUSDT
 | `bot.py` | The Telegram command bot (long-polling service) |
 | `scorecard.py`, `dashboard.py` | Weekly scorecard and the HTML dashboard |
 | `backtest.py` | Walk-forward replay of the live gates on Binance history |
-| `update.sh`, `backup.sh`, `run-*.sh`, `trading-bot.service` | Deploy, backup and service scripts for the VM |
+| `update.sh`, `backup.sh`, `publish-dashboard.sh`, `run-*.sh`, `trading-bot.service` | Deploy, backup, publishing and service scripts for the VM |
 | `Docs/` | Trading plan, the pre-registered test, the case study |
 
 ## Running it
